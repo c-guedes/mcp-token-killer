@@ -73,11 +73,13 @@ def pkt_save(
     status: str = "doing",
     cli: str = "-",
     qa_status: str = "",
+    base_commit: str = "",
     claim: bool = False,
 ) -> str:
     """Build a @PKT line from real Git diff (`f=` and `api=` extracted from Git, never LLM-invented).
 
-    Pass `claim=True` before starting work on `id` to pin `base_commit` to current HEAD.
+    Pass `claim=True` before starting work on `id` to pin `base_commit` to current HEAD, or pass `base_commit`
+    (e.g. `origin/main`) to summarize an external branch/PR.
     """
     try:
         if claim:
@@ -91,6 +93,7 @@ def pkt_save(
             status=status,
             cli=cli,
             qa_status=qa_status,
+            base_commit=base_commit,
         )
     except PktValidationError as exc:
         return f"@PKT|{id}|{status}|{cli}|[INVALID]|op=ERR|why={exc}"

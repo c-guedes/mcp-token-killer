@@ -758,6 +758,7 @@ def build_pkt_from_git(
     cli: str = "-",
     qa_status: str = "",
     delegated: bool = False,
+    base_commit: str = "",
     explicit_files: list[str] | None = None,
     lock_owner: str = "",
     store_path: str | None = None,
@@ -766,6 +767,7 @@ def build_pkt_from_git(
     facts = extract_git_facts(
         workspace=workspace,
         task_id=task_id,
+        base_commit=base_commit,
         explicit_files=explicit_files,
         lock_owner=lock_owner,
     )

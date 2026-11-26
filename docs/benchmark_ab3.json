@@ -1,0 +1,427 @@
+{
+  "n_per_arm": 5,
+  "model": "claude-sonnet",
+  "repo_files": 60,
+  "summary": {
+    "A_vague_prose": {
+      "n": 5,
+      "all_ok": true,
+      "prompt_chars": 781,
+      "cost_usd": {
+        "median": 0.12519,
+        "min": 0.12171,
+        "max": 0.13843
+      },
+      "input_tokens_total": {
+        "median": 165980,
+        "min": 160759,
+        "max": 199813
+      },
+      "output_tokens": {
+        "median": 563,
+        "min": 531,
+        "max": 719
+      },
+      "turns": {
+        "median": 5,
+        "min": 5,
+        "max": 6
+      },
+      "tool_count": {
+        "median": 4,
+        "min": 4,
+        "max": 5
+      },
+      "duration_ms": {
+        "median": 28977,
+        "min": 28186,
+        "max": 38945
+      }
+    },
+    "A_prime_fact_prose": {
+      "n": 5,
+      "all_ok": true,
+      "prompt_chars": 711,
+      "cost_usd": {
+        "median": 0.09872,
+        "min": 0.09804,
+        "max": 0.12271
+      },
+      "input_tokens_total": {
+        "median": 98185,
+        "min": 98086,
+        "max": 164625
+      },
+      "output_tokens": {
+        "median": 320,
+        "min": 288,
+        "max": 502
+      },
+      "turns": {
+        "median": 3,
+        "min": 3,
+        "max": 5
+      },
+      "tool_count": {
+        "median": 2,
+        "min": 2,
+        "max": 4
+      },
+      "duration_ms": {
+        "median": 17273,
+        "min": 10425,
+        "max": 27035
+      }
+    },
+    "B_pkt": {
+      "n": 5,
+      "all_ok": true,
+      "prompt_chars": 720,
+      "cost_usd": {
+        "median": 0.09877,
+        "min": 0.0987,
+        "max": 0.09878
+      },
+      "input_tokens_total": {
+        "median": 98283,
+        "min": 98277,
+        "max": 98286
+      },
+      "output_tokens": {
+        "median": 315,
+        "min": 310,
+        "max": 315
+      },
+      "turns": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      },
+      "tool_count": {
+        "median": 2,
+        "min": 2,
+        "max": 2
+      },
+      "duration_ms": {
+        "median": 10232,
+        "min": 10010,
+        "max": 14874
+      }
+    }
+  },
+  "runs": [
+    {
+      "arm": "A_vague_prose",
+      "rep": 1,
+      "ok": true,
+      "prompt_chars": 781,
+      "turns": 6,
+      "duration_ms": 38945,
+      "cost_usd": 0.138433,
+      "input_tokens_total": 199813,
+      "cache_creation_tokens": 19618,
+      "cache_read_tokens": 180187,
+      "uncached_input_tokens": 8,
+      "output_tokens": 719,
+      "tool_count": 5,
+      "tools": [
+        "Bash",
+        "Bash",
+        "Bash",
+        "Bash",
+        "Write"
+      ],
+      "session_id": "3d8e8ef8-44eb-4be7-9031-85ad597880bb"
+    },
+    {
+      "arm": "A_prime_fact_prose",
+      "rep": 1,
+      "ok": true,
+      "prompt_chars": 711,
+      "turns": 3,
+      "duration_ms": 17273,
+      "cost_usd": 0.09804,
+      "input_tokens_total": 98086,
+      "cache_creation_tokens": 18632,
+      "cache_read_tokens": 79449,
+      "uncached_input_tokens": 5,
+      "output_tokens": 288,
+      "tool_count": 2,
+      "tools": [
+        "Bash",
+        "Write"
+      ],
+      "session_id": "033c2403-4178-4e06-ae33-22f6e8d02e94"
+    },
+    {
+      "arm": "B_pkt",
+      "rep": 1,
+      "ok": true,
+      "prompt_chars": 720,
+      "turns": 3,
+      "duration_ms": 10401,
+      "cost_usd": 0.098769,
+      "input_tokens_total": 98280,
+      "cache_creation_tokens": 18709,
+      "cache_read_tokens": 79566,
+      "uncached_input_tokens": 5,
+      "output_tokens": 315,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "bd089f1d-8c3d-4e2d-b4ed-bd76878b1184"
+    },
+    {
+      "arm": "A_vague_prose",
+      "rep": 2,
+      "ok": true,
+      "prompt_chars": 781,
+      "turns": 5,
+      "duration_ms": 28977,
+      "cost_usd": 0.125001,
+      "input_tokens_total": 165959,
+      "cache_creation_tokens": 19391,
+      "cache_read_tokens": 146561,
+      "uncached_input_tokens": 7,
+      "output_tokens": 553,
+      "tool_count": 4,
+      "tools": [
+        "Bash",
+        "Bash",
+        "Read",
+        "Write"
+      ],
+      "session_id": "7b2917ab-fd6d-425c-9088-e13bf6e3f595"
+    },
+    {
+      "arm": "A_prime_fact_prose",
+      "rep": 2,
+      "ok": true,
+      "prompt_chars": 711,
+      "turns": 3,
+      "duration_ms": 10425,
+      "cost_usd": 0.098718,
+      "input_tokens_total": 98185,
+      "cache_creation_tokens": 18681,
+      "cache_read_tokens": 79499,
+      "uncached_input_tokens": 5,
+      "output_tokens": 320,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "abe74df3-580c-415e-9f08-2f2bd8f06ab8"
+    },
+    {
+      "arm": "B_pkt",
+      "rep": 2,
+      "ok": true,
+      "prompt_chars": 720,
+      "turns": 3,
+      "duration_ms": 10010,
+      "cost_usd": 0.098701,
+      "input_tokens_total": 98283,
+      "cache_creation_tokens": 18711,
+      "cache_read_tokens": 79567,
+      "uncached_input_tokens": 5,
+      "output_tokens": 310,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "c941ccc5-f530-4a9a-960a-6ca4bb3efb81"
+    },
+    {
+      "arm": "A_vague_prose",
+      "rep": 3,
+      "ok": true,
+      "prompt_chars": 781,
+      "turns": 5,
+      "duration_ms": 28699,
+      "cost_usd": 0.125191,
+      "input_tokens_total": 165980,
+      "cache_creation_tokens": 19401,
+      "cache_read_tokens": 146572,
+      "uncached_input_tokens": 7,
+      "output_tokens": 563,
+      "tool_count": 4,
+      "tools": [
+        "Bash",
+        "Bash",
+        "Read",
+        "Write"
+      ],
+      "session_id": "86e520d1-3a88-420f-8b3b-1fe1f7dccbee"
+    },
+    {
+      "arm": "A_prime_fact_prose",
+      "rep": 3,
+      "ok": true,
+      "prompt_chars": 711,
+      "turns": 3,
+      "duration_ms": 18264,
+      "cost_usd": 0.09867,
+      "input_tokens_total": 98162,
+      "cache_creation_tokens": 18669,
+      "cache_read_tokens": 79488,
+      "uncached_input_tokens": 5,
+      "output_tokens": 320,
+      "tool_count": 2,
+      "tools": [
+        "Bash",
+        "Write"
+      ],
+      "session_id": "7916837a-23b4-4a41-8b29-e2201dc5c25b"
+    },
+    {
+      "arm": "B_pkt",
+      "rep": 3,
+      "ok": true,
+      "prompt_chars": 720,
+      "turns": 3,
+      "duration_ms": 10232,
+      "cost_usd": 0.098777,
+      "input_tokens_total": 98286,
+      "cache_creation_tokens": 18711,
+      "cache_read_tokens": 79570,
+      "uncached_input_tokens": 5,
+      "output_tokens": 315,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "205d4416-95a6-4068-95bd-ba4f77a27514"
+    },
+    {
+      "arm": "A_vague_prose",
+      "rep": 4,
+      "ok": true,
+      "prompt_chars": 781,
+      "turns": 5,
+      "duration_ms": 29884,
+      "cost_usd": 0.125433,
+      "input_tokens_total": 166106,
+      "cache_creation_tokens": 19447,
+      "cache_read_tokens": 146652,
+      "uncached_input_tokens": 7,
+      "output_tokens": 566,
+      "tool_count": 4,
+      "tools": [
+        "Bash",
+        "Bash",
+        "Bash",
+        "Write"
+      ],
+      "session_id": "619cca32-79c5-4cb4-aa93-39e646b990a5"
+    },
+    {
+      "arm": "A_prime_fact_prose",
+      "rep": 4,
+      "ok": true,
+      "prompt_chars": 711,
+      "turns": 5,
+      "duration_ms": 27035,
+      "cost_usd": 0.122714,
+      "input_tokens_total": 164625,
+      "cache_creation_tokens": 19066,
+      "cache_read_tokens": 145552,
+      "uncached_input_tokens": 7,
+      "output_tokens": 502,
+      "tool_count": 4,
+      "tools": [
+        "Bash",
+        "Bash",
+        "Read",
+        "Write"
+      ],
+      "session_id": "d695923e-b3a7-451e-96a9-9052bc3b457a"
+    },
+    {
+      "arm": "B_pkt",
+      "rep": 4,
+      "ok": true,
+      "prompt_chars": 720,
+      "turns": 3,
+      "duration_ms": 10167,
+      "cost_usd": 0.098773,
+      "input_tokens_total": 98283,
+      "cache_creation_tokens": 18710,
+      "cache_read_tokens": 79568,
+      "uncached_input_tokens": 5,
+      "output_tokens": 315,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "48d6fccf-fcd2-4730-ae97-5c5613d372d3"
+    },
+    {
+      "arm": "A_vague_prose",
+      "rep": 5,
+      "ok": true,
+      "prompt_chars": 781,
+      "turns": 5,
+      "duration_ms": 28186,
+      "cost_usd": 0.121713,
+      "input_tokens_total": 160759,
+      "cache_creation_tokens": 18986,
+      "cache_read_tokens": 141766,
+      "uncached_input_tokens": 7,
+      "output_tokens": 531,
+      "tool_count": 4,
+      "tools": [
+        "Bash",
+        "Bash",
+        "Read",
+        "Write"
+      ],
+      "session_id": "fa6e33b1-321c-4291-aeac-e86129fe69c4"
+    },
+    {
+      "arm": "A_prime_fact_prose",
+      "rep": 5,
+      "ok": true,
+      "prompt_chars": 711,
+      "turns": 3,
+      "duration_ms": 12415,
+      "cost_usd": 0.098763,
+      "input_tokens_total": 98185,
+      "cache_creation_tokens": 18681,
+      "cache_read_tokens": 79499,
+      "uncached_input_tokens": 5,
+      "output_tokens": 323,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "6c74f9a5-3ec8-44fb-8a1a-a5b8e7f8a81a"
+    },
+    {
+      "arm": "B_pkt",
+      "rep": 5,
+      "ok": true,
+      "prompt_chars": 720,
+      "turns": 3,
+      "duration_ms": 14874,
+      "cost_usd": 0.098764,
+      "input_tokens_total": 98277,
+      "cache_creation_tokens": 18708,
+      "cache_read_tokens": 79564,
+      "uncached_input_tokens": 5,
+      "output_tokens": 315,
+      "tool_count": 2,
+      "tools": [
+        "Read",
+        "Write"
+      ],
+      "session_id": "0865f35d-b10c-4d86-b640-e5e14201ff71"
+    }
+  ]
+}

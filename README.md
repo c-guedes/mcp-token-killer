@@ -35,8 +35,8 @@ Em fluxos multi-agente, handoffs em prosa (*"editei a classe X, tive um erro na 
 - `agent_run(cli, prompt, workspace=".", pkt_ref="", session_id="", mode="read", model="", role="", task_id="", fallback=True)`
   - Orquestra `grok`, `codex`, `claude`, `gemini`, `opencode` ou `agy` (ou `cli="status"` para listar disponibilidade/cooldowns).
   - Em `mode="work"`, fixa `base_commit` no primeiro claim, detecta arquivos alterados por hash de conteúdo (incluindo arquivos já sujos editados novamente) e devolve `"pkt"` gerado direto do Git.
-- `pkt_save(id, handoff_why="", handoff_next="", workspace=".", op="HND", status="doing", cli="-", qa_status="", claim=False)`
-  - Gera um `@PKT` combinando `f=` e `api=` extraídos do Git com o `why` e `nxt` informados. Passe `claim=True` antes de iniciar edições manuais para fixar o `base_commit`.
+- `pkt_save(id, handoff_why="", handoff_next="", workspace=".", op="HND", status="doing", cli="-", qa_status="", base_commit="", claim=False)`
+  - Gera um `@PKT` combinando `f=` e `api=` extraídos do Git com o `why` e `nxt` informados. Passe `claim=True` antes de iniciar edições manuais para fixar o `base_commit`, ou `base_commit="origin/main"` para extrair o pacote de uma branch/PR externo (ex.: Devin, CI).
 - `pkt_get(ref="", workspace=".", limit=15)`
   - Expande o payload integral de um `ref=<id>#<sha8>` ou lista refs recentes quando `ref` está vazio.
 - `rtk_run(cmd, workspace=".", timeout=60)`
@@ -86,6 +86,38 @@ O `install.py` registra o servidor globalmente nas CLIs instaladas (`grok`, `cod
 | `MCP_AGENTS_MAX_DEPTH` | Profundidade máxima de delegação entre agentes (padrão: `2`) |
 | `MCP_ALLOW_WORKSPACE_ROLES=1` | Permite carregar `.mcp-agents/roles.json` e `.claude/agents/*.md` do workspace |
 | `MCP_ALLOW_WORKSPACE_HOOKS=1` | Permite executar `.mcp-agents/prompt_hook.py` do workspace |
+
+---
+
+## Benchmark empírico (3 braços × n=5)
+
+Experimento controlado em `claude --model sonnet` sobre um repositório Git limpo com **60 módulos `.gd`** distribuídos em 6 pastas, onde o Agente 1 já commitou `class_name CritEngine` (`static func compute_crit_damage(...)`) em `scripts/combat/effects/sys_7.gd`, e o Agente 2 recebe o bastão para criar `hit_apply.gd`. As 15 execuções foram intercaladas (`#1..#5` entre os 3 braços) em repositórios descartáveis independentes; os dados brutos e `session_id`s estão em [`docs/benchmark_ab3.json`](docs/benchmark_ab3.json).
+
+- **Braço A (`A_vague_prose`):** resumo narrativo típico de agente (~780 chars) descrevendo o que foi feito, sem caminho nem assinatura exatos.
+- **Braço A' (`A_prime_fact_prose`):** parágrafo em prosa natural (~710 chars) contendo **exatamente os mesmos fatos** do `@PKT` (`scripts/combat/effects/sys_7.gd`, `class_name CritEngine` e assinatura completa).
+- **Braço B (`B_pkt`):** `@PKT` + `[REPOMAP]` extraídos automaticamente do Git (~720 chars com envelope).
+
+| Braço (n=5 cada, 100% acerto) | Custo faturado USD — Mediana `[min..max]` | Input tokens totais — Mediana `[min..max]` | Turnos — Mediana `[min..max]` | Tools — Mediana `[min..max]` | Tempo (s) — Mediana `[min..max]` |
+|---|---|---|---|---|---|
+| **A: Prosa narrativa vaga** | **`$0,1252`** `[$0,1217..$0,1384]` | `165.980` `[160.759..199.813]` | `5` `[5..6]` | `4` `[4..5]` | `29,0s` `[28,2..38,9s]` |
+| **A': Prosa com os mesmos fatos** | **`$0,0987`** `[$0,0980..$0,1227]` | `98.185` `[98.086..164.625]` | `3` `[3..5]` | `2` `[2..4]` | `17,3s` `[10,4..27,0s]` |
+| **B: `@PKT` + `RepoMap` (Git)** | **`$0,0988`** `[$0,0987..$0,0988]` | `98.283` `[98.277..98.286]` | `3` `[3..3]` | `2` `[2..2]` | `10,2s` `[10,0..14,9s]` |
+
+### O que os dados mostram (e o que não mostram)
+
+1. **Redução de custo faturado (`B` vs `A`): `-21,1%` na mediana (`$0,1252` → `$0,0988`)**, enquanto os tokens de entrada caem **`-40,8%`** (`165.980` → `98.283`). O custo em dólares cai menos que os tokens brutos porque a criação inicial de cache do system prompt da CLI (~21k tokens) é um custo fixo de 1º turno e as releituras entre turnos usam tarifa reduzida de cache.
+2. **De onde vem o ganho (`A'` ≈ `B` na mediana):** quando a prosa em linguagem natural (`A'`) carrega manualmente todos os fatos exatos, a mediana de custo empata com `B` (`$0,0987` vs `$0,0988`). Ou seja, **o ganho principal vem de extrair os fatos determinísticos do Git** (em vez de depender de o modelo anterior lembrar de escrever caminhos e tipos sem omitir nada, o que na prática degrada para `A`).
+3. **Onde o formato estruturado `B` supera `A'` (variância de cauda e latência):** mesmo com todos os fatos na prosa `A'`, em **3 de 5** rodadas o modelo ainda abriu `Bash` para conferir o repositório (elevando o pior caso de `A'` a `$0,1227` / `164.625` tokens / `27,0s`). No `B` (`@PKT` + `[POLICY]`), **5 de 5** rodadas executaram exatamente `['Read', 'Write']`, cravando o teto em `$0,0988` e baixando a mediana de tempo de `17,3s` para **`10,2s` (`-40,8%` vs `A'`, `-64,7%` vs `A`)**.
+4. **Quando NÃO há ganho (contra-exemplo):** em repositórios pequenos onde o único arquivo alterado ainda está sujo no `git status`, o cabeçalho automático de status da CLI já entrega o caminho ao modelo; nesse cenário `A` e `B` empatam (`~98k` tokens, `2` tools).
+
+### Exemplo ilustrativo em projeto real (`KB-0357`)
+
+Na execução real de uma tarefa de manutenção em repositório grande (`grok:architect` → `codex:coder` → failover `429` do `claude` → `grok:reviewer`), a telemetria oficial da CLI (`grok usage`) registrou `2.052.848` input tokens / `15` chamadas (`$2,70`) no agente que explorou do zero (`architect`) e `843.909` input tokens / `8` chamadas (`$1,36`) no agente que recebeu o `@PKT` com os 6 arquivos tocados (`reviewer`). *(Nota: trata-se de observação ilustrativa de fluxo real, não de A/B causal, pois `architect` e `reviewer` executam papéis distintos.)*
+
+Para auditar métricas reais do seu próprio workspace a qualquer momento:
+```bash
+python pkt_report.py /caminho/do/workspace
+```
 
 ---
 
