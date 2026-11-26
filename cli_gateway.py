@@ -1,0 +1,563 @@
+"""Lean multi-CLI gateway with Windows wrapper resolution, session resume, and @PKT injection."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+from pkt_core import acquire_locks, get_recent_deltas, record_deltas, release_locks, resolve_pkt_ref, smart_truncate
+
+MAX_DEPTH = 2
+DEFAULT_TIMEOUT = 180
+DEFAULT_CHAIN = ("grok", "codex", "opencode", "claude", "gemini", "agy")
+
+_NPM_JS_TARGETS = {
+    "grok": os.path.join("node_modules", "@xai-official", "grok", "bin", "grok"),
+    "codex": os.path.join("node_modules", "@openai", "codex", "bin", "codex.js"),
+    "gemini": os.path.join("node_modules", "@google", "gemini-cli", "dist", "index.js"),
+}
+
+_LIMIT_PATTERNS = (
+    "rate limit", "rate_limit", "quota", "too many requests", "429",
+    "credit balance", "usage limit", "hit your limit", "overloaded",
+)
+
+_COOLDOWNS: dict[str, float] = {}
+
+
+def _env_bin(cli: str) -> str:
+    return os.environ.get(f"MCP_CLI_{cli.upper()}", "").strip() or cli
+
+
+def resolve_exe(cmd: list[str]) -> list[str]:
+    """Resolves cmd[0] to a native .exe or `node <script.js>` to bypass Windows 8191-char .cmd/.ps1 limits."""
+    if not cmd:
+        return cmd
+    exe = shutil.which(cmd[0])
+    if not exe:
+        return []
+    low = exe.lower()
+    if low.endswith((".cmd", ".bat", ".ps1")):
+        dp0 = os.path.dirname(exe)
+        base = os.path.splitext(os.path.basename(exe))[0].lower()
+        if base == "opencode":
+            native = os.path.join(dp0, "node_modules", "opencode-ai", "bin", "opencode.exe")
+            if os.path.exists(native):
+                return [native] + cmd[1:]
+        if base in _NPM_JS_TARGETS:
+            target = os.path.join(dp0, _NPM_JS_TARGETS[base])
+            node = os.path.join(dp0, "node.exe")
+            if not os.path.exists(node):
+                node = shutil.which("node") or ""
+            if node and os.path.exists(target):
+                return [node, target] + cmd[1:]
+    return [exe] + cmd[1:]
+
+
+def build_cmd(
+    cli: str,
+    prompt: str,
+    workspace: str = ".",
+    mode: str = "read",
+    model: str = "",
+    session_id: str = "",
+) -> list[str]:
+    """Builds the headless CLI command for read/work mode with optional session resume."""
+    work = str(mode).lower() == "work"
+    bin_name = _env_bin(cli)
+    ws = os.path.abspath(workspace or ".")
+
+    if cli == "grok":
+        cmd = [bin_name, "--cwd", ws, "--output-format", "json"]
+        if work:
+            cmd.append("--always-approve")
+        if model:
+            cmd += ["-m", model]
+        if session_id:
+            cmd += ["-r", session_id]
+        cmd += ["-p", prompt]
+        return cmd
+
+    if cli == "codex":
+        cmd = [bin_name, "exec", "--skip-git-repo-check"]
+        if work:
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        if model:
+            cmd += ["-m", model]
+        if session_id:
+            cmd += ["resume", session_id, prompt]
+        else:
+            cmd.append(prompt)
+        return cmd
+
+    if cli == "claude":
+        cmd = [bin_name, "-p", "--exclude-dynamic-system-prompt-sections", "--output-format", "json"]
+        if work:
+            cmd.append("--dangerously-skip-permissions")
+        if model:
+            cmd += ["--model", model]
+        if session_id:
+            cmd += ["--resume", session_id]
+        cmd.append(prompt)
+        return cmd
+
+    if cli == "gemini":
+        cmd = [bin_name]
+        if work:
+            cmd.append("--yolo")
+        if model:
+            cmd += ["-m", model]
+        if session_id:
+            cmd += ["--resume", session_id]
+        cmd += ["-p", prompt]
+        return cmd
+
+    if cli == "opencode":
+        cmd = [bin_name, "run", "--format", "json"]
+        if work:
+            cmd.append("--auto")
+        if model:
+            cmd += ["-m", model]
+        if session_id:
+            cmd += ["-s", session_id]
+        cmd.append(prompt)
+        return cmd
+
+    if cli == "agy":
+        cmd = [bin_name]
+        if work:
+            cmd.append("--dangerously-skip-permissions")
+        if model:
+            cmd += ["--model", model]
+        cmd += ["-p", prompt]
+        return cmd
+
+    raise ValueError(f"Unsupported CLI: {cli}. Supported: {', '.join(DEFAULT_CHAIN)}")
+
+
+def list_clis() -> dict[str, dict]:
+    """Returns availability and cooldown status for each supported CLI."""
+    now = time.time()
+    out = {}
+    for cli in DEFAULT_CHAIN:
+        bin_name = _env_bin(cli)
+        resolved = resolve_exe([bin_name])
+        cd_until = _COOLDOWNS.get(cli, 0.0)
+        out[cli] = {
+            "available": bool(resolved),
+            "path": resolved[0] if resolved else None,
+            "cooldown_s": max(0, int(cd_until - now)),
+        }
+    return out
+
+
+def _is_limit_error(out: str, err: str, rc: int) -> bool:
+    if rc == 0:
+        return False
+    low = ((out or "") + "\n" + (err or "")).lower()
+    return any(p in low for p in _LIMIT_PATTERNS)
+
+
+def _extract_json_response(raw: str) -> tuple[str, str]:
+    """Extracts (text, session_id) when a CLI outputs JSON or NDJSON."""
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    # Try single JSON object first
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            txt = obj.get("result") or obj.get("response") or obj.get("text") or obj.get("content") or ""
+            sid = obj.get("session_id") or obj.get("sessionId") or ""
+            if isinstance(txt, str) and txt:
+                return txt, str(sid)
+    except Exception:
+        pass
+    # Try NDJSON lines (e.g. opencode/claude streaming)
+    sid = ""
+    parts = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            sid = str(obj.get("session_id") or obj.get("sessionId") or obj.get("sessionID") or sid)
+            if obj.get("type") == "result" and isinstance(obj.get("result"), str):
+                return obj["result"], sid
+            part_obj = obj.get("part")
+            if obj.get("type") == "text" and isinstance(part_obj, dict) and isinstance(part_obj.get("text"), str):
+                parts.append(part_obj["text"])
+                continue
+            part = obj.get("text") or obj.get("delta") or ""
+            if isinstance(part, str) and part:
+                parts.append(part)
+    return ("".join(parts) if parts else s), sid
+
+
+def _sessions_path(workspace: str = ".") -> str:
+    return os.path.join(os.path.abspath(workspace or "."), ".mcp-agents", "sessions.json")
+
+
+def get_role_session(cli: str, role: str, workspace: str = ".") -> str:
+    if not role:
+        return ""
+    try:
+        with open(_sessions_path(workspace), encoding="utf-8") as fh:
+            data = json.load(fh)
+            if isinstance(data, dict):
+                return str(data.get(f"{cli}:{role}", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def save_role_session(cli: str, role: str, session_id: str, workspace: str = ".") -> None:
+    if not role or not session_id:
+        return
+    sp = _sessions_path(workspace)
+    os.makedirs(os.path.dirname(sp), exist_ok=True)
+    try:
+        with open(sp, encoding="utf-8") as fh:
+            data = json.load(fh)
+            if not isinstance(data, dict):
+                data = {}
+    except Exception:
+        data = {}
+    data[f"{cli}:{role}"] = session_id
+    tmp = f"{sp}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, sp)
+
+
+def load_role(role: str, workspace: str = ".") -> dict:
+    """Loads role config from `<ws>/.mcp-agents/roles.json`, `<ws>/.claude/agents/<role>.md`, or default roles.json."""
+    r = (role or "").strip()
+    if not r:
+        return {}
+    ws = os.path.abspath(workspace or ".")
+    for path in (
+        os.path.join(ws, ".mcp-agents", "roles.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "roles.json"),
+    ):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict) and r in data and isinstance(data[r], dict):
+                    return dict(data[r])
+        except Exception:
+            pass
+    md_path = os.path.join(ws, ".claude", "agents", f"{r}.md")
+    if os.path.isfile(md_path):
+        try:
+            with open(md_path, encoding="utf-8") as fh:
+                txt = fh.read()
+            if txt.startswith("---"):
+                _, _, body = txt.split("---", 2)
+                txt = body.strip()
+            return {"prompt": smart_truncate(txt, 1500)}
+        except Exception:
+            pass
+    return {"prompt": f"Role: {r}. Stay strictly within this role."}
+
+
+def _run_prompt_hook(prompt: str, workspace: str, session_id: str = "") -> str:
+    """Optional workspace prompt hook (e.g. `.mcp-agents/prompt_hook.py` or `tools/claude_jev_prompt_hook.py`)."""
+    ws = os.path.abspath(workspace or ".")
+    for rel in (os.path.join(".mcp-agents", "prompt_hook.py"), os.path.join("tools", "claude_jev_prompt_hook.py")):
+        hp = os.path.join(ws, rel)
+        if not os.path.isfile(hp):
+            continue
+        try:
+            r = subprocess.run(
+                [sys.executable, hp],
+                cwd=ws,
+                input=json.dumps({"prompt": prompt, "session_id": session_id or "mcp_agents"}),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=6,
+            )
+            data = json.loads(r.stdout or "{}")
+            ctx = ((data.get("hookSpecificOutput") or {}).get("additionalContext") or "").strip()
+            if not ctx:
+                return ""
+            star_lines = [ln for ln in ctx.splitlines() if ln.lstrip().startswith("★")]
+            return smart_truncate("\n".join(star_lines) if star_lines else ctx, 600)
+        except Exception:
+            return ""
+    return ""
+
+
+def build_envelope(
+    prompt: str,
+    workspace: str = ".",
+    pkt_ref: str = "",
+    depth: int = 0,
+    max_depth: int = MAX_DEPTH,
+    target_cli: str = "",
+    role_prompt: str = "",
+    hook_context: str = "",
+    extra_warnings: list[str] | None = None,
+) -> str:
+    """Static-prefix-first envelope (prompt-cache friendly) with role, hook ctx, lazy @PKT, and [DELTA] lines."""
+    depth_note = " Final hop: do NOT delegate via agent_run; answer directly." if depth + 1 >= max_depth else ""
+    blocks = [
+        f"[POLICY depth={depth + 1}/{max_depth}] Use codebase-memory-mcp/graph before grep; prefer `rtk` for heavy shell output.{depth_note}"
+    ]
+    if role_prompt:
+        blocks.append(f"[ROLE] {role_prompt}")
+    if hook_context:
+        blocks.append(f"[HOOK_CTX] {hook_context}")
+    if pkt_ref:
+        ref = pkt_ref.strip()
+        if ref.startswith("@PKT|"):
+            # Lazy-loading: send only the compact 1-line @PKT; agent can call pkt_get(ref) if needed.
+            blocks.append(f"HANDOFF {ref}")
+        else:
+            payload = resolve_pkt_ref(ref, workspace=workspace)
+            if payload:
+                blocks.append(f"PKT_REF={ref}\n" + json.dumps(payload, ensure_ascii=False))
+            else:
+                blocks.append(f"PKT_REF={ref}")
+        target_files = _extract_pkt_files(ref, workspace)
+        deltas = get_recent_deltas(target_files, workspace=workspace, exclude_cli=target_cli)
+        if deltas:
+            blocks.append("\n".join(deltas))
+    if extra_warnings:
+        blocks.append("\n".join(extra_warnings))
+    blocks.append(prompt)
+    return "\n\n".join(blocks)
+
+
+_RECENT_CALLS: dict[tuple[str, str], int] = {}
+
+
+def _extract_pkt_files(pkt_ref: str, workspace: str) -> list[str]:
+    """Extracts target file paths from a @PKT string or resolved ref payload."""
+    ref = (pkt_ref or "").strip()
+    if not ref:
+        return []
+    m_ref = re.search(r"\|ref=([^\s|]+)", ref)
+    key = m_ref.group(1) if m_ref else (ref if "#" in ref else "")
+    if key:
+        payload = resolve_pkt_ref(key, workspace=workspace)
+        if payload and isinstance(payload.get("files"), list):
+            return [str(f) for f in payload["files"] if str(f).strip()]
+    m_f = re.search(r"\|f=([^|]+)", ref)
+    if m_f:
+        raw = m_f.group(1)
+        return [x.strip() for x in raw.split(",") if x.strip() and not x.strip().startswith("(+") and x.strip() != "-"]
+    return []
+
+
+def _git_changed_files(workspace: str) -> set[str]:
+    if not os.path.isdir(os.path.join(workspace, ".git")):
+        return set()
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True, timeout=4)
+        if r.returncode != 0:
+            return set()
+        return {ln[3:].strip() for ln in r.stdout.splitlines() if len(ln) > 3}
+    except Exception:
+        return set()
+
+
+def _git_diff_hunks(workspace: str, files: list[str]) -> dict[str, str]:
+    """Extracts compact `@@ ... @@` line ranges for changed files in a git repo."""
+    if not files or not os.path.isdir(os.path.join(workspace, ".git")):
+        return {}
+    out: dict[str, str] = {}
+    for f in files[:10]:
+        try:
+            r = subprocess.run(["git", "diff", "-U0", "--", f], cwd=workspace, capture_output=True, text=True, timeout=4)
+            hunks = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.startswith("@@")]
+            out[f] = " | ".join(hunks[:4]) if hunks else "modified"
+        except Exception:
+            out[f] = "modified"
+    return out
+
+
+def _log_metric(workspace: str, cli: str, mode: str, ok: bool, secs: float, prompt_len: int, pkt_len: int, out_len: int) -> None:
+    try:
+        path = os.path.join(os.path.abspath(workspace or "."), ".mcp-agents", "metrics.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "cli": cli,
+            "mode": mode,
+            "ok": ok,
+            "secs": round(secs, 2),
+            "prompt_chars": prompt_len,
+            "pkt_chars": pkt_len,
+            "out_chars": out_len,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def run_cli(
+    cli: str,
+    prompt: str,
+    workspace: str = ".",
+    pkt_ref: str = "",
+    session_id: str = "",
+    mode: str = "read",
+    model: str = "",
+    role: str = "",
+    timeout: int = DEFAULT_TIMEOUT,
+    fallback: bool = True,
+) -> dict:
+    """Executes a CLI headlessly, returning text, session_id, cli used, and rc."""
+    ws = os.path.abspath(workspace or ".")
+    role_cfg = load_role(role, workspace=ws) if role else {}
+    if role_cfg.get("mode") and mode == "read":
+        mode = str(role_cfg["mode"])
+    if role_cfg.get("model") and not model:
+        model = str(role_cfg["model"])
+
+    max_depth = int(os.environ.get("MCP_AGENTS_MAX_DEPTH", str(MAX_DEPTH)) or MAX_DEPTH)
+    depth = int(os.environ.get("MCP_AGENTS_DEPTH", "0") or "0")
+    if depth >= max_depth:
+        return {"ok": False, "cli": cli, "rc": 3, "error": f"Max recursion depth ({max_depth}) reached. Synthesize and answer directly."}
+
+    actor = f"{cli}:{role}" if role else cli
+    chain_env = [c for c in os.environ.get("MCP_AGENTS_CHAIN", "").split(">") if c]
+    if actor in chain_env:
+        return {"ok": False, "cli": cli, "rc": 3, "error": f"Cycle blocked: {' > '.join(chain_env)} -> {actor}. Answer directly."}
+
+    call_key = (actor, prompt[:200])
+    if _RECENT_CALLS.get(call_key, 0) >= 3:
+        return {"ok": False, "cli": cli, "rc": 3, "error": f"Circuit breaker: repeated identical call to {actor} (3x). Try a different approach."}
+    _RECENT_CALLS[call_key] = _RECENT_CALLS.get(call_key, 0) + 1
+
+    if session_id == "new":
+        eff_sid = ""
+    elif session_id:
+        eff_sid = session_id
+    elif role:
+        eff_sid = get_role_session(cli, role, workspace=ws)
+    else:
+        eff_sid = ""
+
+    work = str(mode).lower() == "work"
+    lock_owner = f"{actor}:{os.getpid()}"
+    locked_files: list[str] = []
+    warnings: list[str] = []
+    if work and pkt_ref:
+        locked_files = _extract_pkt_files(pkt_ref, ws)
+        if locked_files:
+            ok_lock, conflicts = acquire_locks(lock_owner, locked_files, workspace=ws, cli=actor)
+            if not ok_lock:
+                # Advisory non-blocking warning so collaborative edits are never deadlocked
+                warnings.append("[CONCURRENT_EDIT] " + "; ".join(f"{c.get('file')} active by {c.get('cli')}" for c in conflicts))
+                locked_files = []
+
+    hook_ctx = _run_prompt_hook(prompt, workspace=ws, session_id=eff_sid)
+    full_prompt = build_envelope(
+        prompt,
+        workspace=ws,
+        pkt_ref=pkt_ref,
+        depth=depth,
+        max_depth=max_depth,
+        target_cli=cli,
+        role_prompt=str(role_cfg.get("prompt") or ""),
+        hook_context=hook_ctx,
+        extra_warnings=warnings,
+    )
+    pkt_len = len(pkt_ref or "")
+
+    now = time.time()
+    chain = [cli]
+    if fallback and not eff_sid:
+        for c in DEFAULT_CHAIN:
+            cand_actor = f"{c}:{role}" if role else c
+            if c != cli and cand_actor not in chain_env and _COOLDOWNS.get(c, 0.0) <= now:
+                chain.append(c)
+
+    env = dict(os.environ)
+    env["MCP_AGENTS_DEPTH"] = str(depth + 1)
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    last_err = ""
+    try:
+        for cand in chain:
+            if _COOLDOWNS.get(cand, 0.0) > now and cand != cli:
+                continue
+            cand_actor = f"{cand}:{role}" if role else cand
+            env["MCP_AGENTS_CHAIN"] = ">".join(chain_env + [cand_actor])
+            raw_cmd = build_cmd(cand, full_prompt, workspace=ws, mode=mode, model=model if cand == cli else "", session_id=eff_sid if cand == cli else "")
+            cmd = resolve_exe(raw_cmd)
+            if not cmd:
+                last_err = f"'{_env_bin(cand)}' not found in PATH"
+                continue
+            files_before = _git_changed_files(ws) if work else set()
+            t0 = time.time()
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=ws,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _log_metric(ws, cand, mode, False, time.time() - t0, len(full_prompt), pkt_len, 0)
+                last_err = f"{cand} timed out after {timeout}s"
+                continue
+            except Exception as exc:
+                _log_metric(ws, cand, mode, False, time.time() - t0, len(full_prompt), pkt_len, 0)
+                last_err = f"{cand} failed: {exc}"
+                continue
+
+            dur = time.time() - t0
+            if _is_limit_error(proc.stdout, proc.stderr, proc.returncode):
+                _COOLDOWNS[cand] = time.time() + 180
+                _log_metric(ws, cand, mode, False, dur, len(full_prompt), pkt_len, 0)
+                last_err = (proc.stderr or proc.stdout or "rate limit")[-200:]
+                continue
+
+            text, out_sid = _extract_json_response(proc.stdout)
+            changed = sorted(_git_changed_files(ws) - files_before) if work else []
+            if work and changed:
+                record_deltas(cand_actor, _git_diff_hunks(ws, changed), workspace=ws)
+            if proc.returncode == 0 and (text or changed):
+                _log_metric(ws, cand, mode, True, dur, len(full_prompt), pkt_len, len(text))
+                final_sid = out_sid or (eff_sid if cand == cli else "")
+                if role and final_sid:
+                    save_role_session(cand, role, final_sid, workspace=ws)
+                res = {
+                    "ok": True,
+                    "cli": cand,
+                    "role": role,
+                    "rc": 0,
+                    "session_id": final_sid,
+                    "output": smart_truncate(text or "(files modified)", 8000),
+                }
+                if changed:
+                    res["changed_files"] = changed
+                return res
+            _log_metric(ws, cand, mode, False, dur, len(full_prompt), pkt_len, len(text))
+            last_err = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-400:]
+            if not fallback or eff_sid:
+                break
+    finally:
+        if locked_files:
+            release_locks(lock_owner, workspace=ws, files=locked_files)
+
+    return {"ok": False, "cli": cli, "rc": 1, "error": last_err or "No available CLI succeeded."}
