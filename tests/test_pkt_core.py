@@ -147,9 +147,9 @@ class TestGitFactExtraction(unittest.TestCase):
         with open(os.path.join(self.tmp, "outro.gd"), "w", encoding="utf-8") as fh:
             fh.write("func intruder():\n    pass\n")
 
-        # Worker 2 adds Player.gd (uncommitted, observed via owned_files)
+        # Worker 2 adds Player.gd (uncommitted, observed via owned_files) with `class_name Player`
         with open(os.path.join(self.tmp, "Player.gd"), "w", encoding="utf-8") as fh:
-            fh.write("@export var speed: int = 5\nfunc _ready():\n    pass\nfunc apply_stun(d: int):\n    pass\n")
+            fh.write("class_name Player\n@export var speed: int = 5\nfunc _ready():\n    pass\nfunc apply_stun(d: int):\n    pass\n")
         pkt.record_task_owned_files("KB-19", ["Player.gd"], workspace=self.tmp)
 
         line = pkt.build_pkt_from_git("KB-19", workspace=self.tmp, cli="claude", handoff_why="stun", handoff_next="wire hud")
@@ -157,8 +157,8 @@ class TestGitFactExtraction(unittest.TestCase):
         self.assertNotIn("outro.gd", line)
         self.assertNotIn(".mcp-agents", line)
         self.assertIn("f=Combat.cs,Player.gd", line)
-        self.assertIn("@export var speed", line)
-        self.assertIn("apply_stun", line)
+        self.assertIn("Player.gd(class_name Player): `@export var speed", line)
+        self.assertIn("Player.gd(class_name Player): `func apply_stun", line)
         self.assertNotIn("_ready", line)
         self.assertNotIn("PARTIAL_DIFF", line)
         self.assertNotIn("(?)", line)

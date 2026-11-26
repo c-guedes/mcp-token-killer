@@ -316,17 +316,49 @@ def diff_worktree_snapshots(workspace: str, before: dict[str, str], after: dict[
     return sorted(changed)
 
 
-def extract_contracts_from_diff(diff_text: str) -> list[str]:
+def _gd_class_name(workspace: str, rel_path: str) -> str:
+    """Reads `class_name <Name>` from a GDScript file header if present on disk."""
+    if not rel_path or not rel_path.lower().endswith(".gd"):
+        return ""
+    full = os.path.join(os.path.abspath(workspace or "."), rel_path)
+    if not os.path.isfile(full):
+        return ""
+    try:
+        with open(full, encoding="utf-8", errors="replace") as fh:
+            for _ in range(30):
+                ln = fh.readline()
+                if not ln:
+                    break
+                m = re.match(r"^\s*class_name\s+([A-Za-z0-9_]+)", ln)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+def extract_contracts_from_diff(diff_text: str, workspace: str = ".") -> list[str]:
     """Extracts public interface contracts from unified diff `+` lines via `CONTRACT_SIG_RE`."""
     contracts: list[str] = []
     cur_file = ""
+    gd_cls_cache: dict[str, str] = {}
     for line in (diff_text or "").splitlines():
         if line.startswith("+++ b/"):
             cur_file = line[6:].strip()
             continue
         if line.startswith("+") and not line.startswith("+++") and CONTRACT_SIG_RE.search(line):
             clean = re.sub(r"\s+", " ", line[1:].strip()).rstrip("{:").strip()
-            prefix = f"{os.path.basename(cur_file)}: " if cur_file else ""
+            if clean.startswith("class_name "):
+                continue  # Captured as file qualifier `file.gd(class_name X)` instead of consuming a contract slot
+            if cur_file:
+                base = os.path.basename(cur_file)
+                if cur_file not in gd_cls_cache:
+                    gd_cls_cache[cur_file] = _gd_class_name(workspace, cur_file)
+                cls_name = gd_cls_cache[cur_file]
+                qual = f"(class_name {cls_name})" if cls_name else ""
+                prefix = f"{base}{qual}: "
+            else:
+                prefix = ""
             entry = f"{prefix}`{clean[:90]}`"
             if entry not in contracts:
                 contracts.append(entry)
@@ -470,7 +502,7 @@ def extract_git_facts(
             if r_diff.stdout:
                 diff_chunks.append(r_diff.stdout)
 
-        contracts = extract_contracts_from_diff("\n".join(diff_chunks))
+        contracts = extract_contracts_from_diff("\n".join(diff_chunks), workspace=ws)
 
     return {
         "touched_files": ordered_files,

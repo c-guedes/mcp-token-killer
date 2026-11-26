@@ -38,8 +38,8 @@ _NPM_JS_TARGETS = {
 }
 
 _LIMIT_PATTERNS = (
-    "rate limit", "rate_limit", "quota", "too many requests", "429",
-    "credit balance", "usage limit", "hit your limit", "overloaded",
+    "rate limit", "rate_limit", "quota", "too many requests", "429", "402",
+    "credit balance", "balance exhausted", "usage limit", "hit your limit", "overloaded",
 )
 
 _COOLDOWNS: dict[str, float] = {}
