@@ -206,34 +206,41 @@ def build_cmd(
     raise ValueError(f"Unsupported CLI: {cli}. Supported: {', '.join(DEFAULT_CHAIN)}")
 
 
+def _probe_dir() -> str:
+    """Fixed, empty-ish scratch dir for login probes. Never deleted: on Windows a CLI may leave a
+    background process (e.g. a leader/daemon) holding it as cwd, and removing it would fail."""
+    import tempfile
+
+    d = os.path.join(tempfile.gettempdir(), "mcp_agents_login_probe")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def probe_login(cli: str, timeout: int = LOGIN_PROBE_TIMEOUT) -> dict:
     """Runs a minimal headless prompt to check that `cli` is logged in and answering.
 
-    Runs in an empty temporary directory, in read mode, with recursion disabled, so the probe
-    neither reads the project nor calls other agents. Costs one tiny request per CLI.
+    Runs in a fixed scratch directory outside any project, in read mode, with recursion disabled,
+    so the probe neither reads the project nor calls other agents. Costs one tiny request per CLI.
+    Never raises: any unexpected failure is reported as `login: error`.
     """
-    import tempfile
-
     if cli not in allowed_clis():
         return {"login": "not_allowed"}
-    raw_cmd = build_cmd(cli, LOGIN_PROBE_PROMPT, workspace=".", mode="read")
-    cmd = resolve_exe(raw_cmd)
-    if not cmd:
-        return {"login": "not_installed"}
-    env = dict(os.environ)
-    env["MCP_AGENTS_DEPTH"] = str(MAX_DEPTH + 10)  # nested agent_run calls refuse immediately
-    env["PYTHONIOENCODING"] = "utf-8"
     t0 = time.time()
-    with tempfile.TemporaryDirectory(prefix="mcp_login_") as tmp:
+    try:
+        raw_cmd = build_cmd(cli, LOGIN_PROBE_PROMPT, workspace=".", mode="read")
+        cmd = resolve_exe(raw_cmd)
+        if not cmd:
+            return {"login": "not_installed"}
+        env = dict(os.environ)
+        env["MCP_AGENTS_DEPTH"] = str(MAX_DEPTH + 10)  # nested agent_run calls refuse immediately
+        env["PYTHONIOENCODING"] = "utf-8"
         try:
             proc = subprocess.run(
-                cmd, cwd=tmp, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                cmd, cwd=_probe_dir(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", env=env, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             res = {"login": "timeout", "detail": f"no answer in {timeout}s"}
-        except Exception as exc:
-            res = {"login": "error", "detail": smart_truncate(str(exc), 200)}
         else:
             text, _sid, _usage = _extract_json_response(proc.stdout)
             blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
@@ -245,6 +252,8 @@ def probe_login(cli: str, timeout: int = LOGIN_PROBE_TIMEOUT) -> dict:
                 res = {"login": "ok", "answer": smart_truncate(text.strip(), 40)}
             else:
                 res = {"login": "error", "detail": smart_truncate(blob.strip() or f"rc={proc.returncode}", 200)}
+    except Exception as exc:  # never let one CLI break the whole status report
+        res = {"login": "error", "detail": smart_truncate(f"{type(exc).__name__}: {exc}", 200)}
     res["secs"] = round(time.time() - t0, 1)
     _LOGIN_STATE[cli] = {"login": res["login"], "ts": time.time(), "detail": res.get("detail", "")}
     return res

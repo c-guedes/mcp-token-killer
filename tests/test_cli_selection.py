@@ -113,7 +113,7 @@ class TestLogin(Base):
         def fake(cmd, **kw):
             if exc:
                 raise exc
-            self.assertNotEqual(kw.get("cwd"), self.tmp)  # probe runs in an empty temp dir
+            self.assertEqual(kw.get("cwd"), gw._probe_dir())  # fixed scratch dir, outside the project
             self.assertGreaterEqual(int(kw["env"]["MCP_AGENTS_DEPTH"]), gw.MAX_DEPTH)  # no nested agents
             return subprocess.CompletedProcess(cmd, rc, out, err)
 
@@ -182,6 +182,11 @@ class TestLogin(Base):
                     else (called.append(cmd[0]) or subprocess.CompletedProcess(cmd, 1, "", "429 rate limit")))):
                 gw.run_cli("codex", "y", workspace=self.tmp)
         self.assertEqual(called, ["codex"])
+
+    def test_unexpected_exception_is_reported_not_raised(self):
+        r = self._probe_with(0, "", exc=PermissionError("[WinError 32] in use"))
+        self.assertEqual(r["login"], "error")
+        self.assertIn("PermissionError", r["detail"])
 
     def test_normal_failure_is_not_auth(self):
         self.assertFalse(gw._is_auth_error("", "SyntaxError: broken build", 1))
