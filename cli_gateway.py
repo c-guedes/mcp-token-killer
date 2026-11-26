@@ -362,7 +362,7 @@ def build_envelope(
     """Static-prefix-first envelope (prompt-cache friendly) with role, lazy @PKT, JIT RepoMap, and [DELTA]."""
     depth_note = " Final hop: do NOT delegate via agent_run; answer directly." if depth + 1 >= max_depth else ""
     blocks = [
-        f"[POLICY depth={depth + 1}/{max_depth}] Use codebase-memory-mcp/graph before grep; prefer `rtk` for heavy shell output.{depth_note}"
+        f"[POLICY depth={depth + 1}/{max_depth}] Trust @PKT `f=`/`api=` and [REPOMAP] directly without re-searching; for unknown symbols use graph before grep; prefer `rtk` for heavy shell output.{depth_note}"
     ]
     if role_prompt:
         blocks.append(f"[ROLE] {role_prompt}")
