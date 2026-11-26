@@ -1,4 +1,4 @@
-"""Lean multi-CLI gateway with Windows wrapper resolution, session resume, and @PKT injection."""
+"""Lean multi-CLI gateway with Windows wrapper resolution, session resume, security guards, and Git-backed @PKT."""
 from __future__ import annotations
 
 import json
@@ -8,8 +8,23 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
-from pkt_core import acquire_locks, get_recent_deltas, record_deltas, release_locks, resolve_pkt_ref, smart_truncate
+from pkt_core import (
+    acquire_locks,
+    build_pkt_from_git,
+    diff_worktree_snapshots,
+    ensure_base_commit,
+    file_skeleton,
+    get_recent_deltas,
+    is_git_repo,
+    pkt_safe_id,
+    record_deltas,
+    release_locks,
+    resolve_pkt_ref,
+    smart_truncate,
+    snapshot_worktree,
+)
 
 MAX_DEPTH = 2
 DEFAULT_TIMEOUT = 180
@@ -27,6 +42,7 @@ _LIMIT_PATTERNS = (
 )
 
 _COOLDOWNS: dict[str, float] = {}
+_RECENT_CALLS: dict[tuple[str, str], int] = {}
 
 
 def _env_bin(cli: str) -> str:
@@ -167,17 +183,15 @@ def _extract_json_response(raw: str) -> tuple[str, str]:
     s = (raw or "").strip()
     if not s:
         return "", ""
-    # Try single JSON object first
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
             txt = obj.get("result") or obj.get("response") or obj.get("text") or obj.get("content") or ""
-            sid = obj.get("session_id") or obj.get("sessionId") or ""
+            sid = obj.get("session_id") or obj.get("sessionId") or obj.get("sessionID") or ""
             if isinstance(txt, str) and txt:
                 return txt, str(sid)
     except Exception:
         pass
-    # Try NDJSON lines (e.g. opencode/claude streaming)
     sid = ""
     parts = []
     for line in s.splitlines():
@@ -239,15 +253,19 @@ def save_role_session(cli: str, role: str, session_id: str, workspace: str = "."
 
 
 def load_role(role: str, workspace: str = ".") -> dict:
-    """Loads role config from `<ws>/.mcp-agents/roles.json`, `<ws>/.claude/agents/<role>.md`, or default roles.json."""
+    """Loads built-in role config; workspace roles require explicit opt-in `MCP_ALLOW_WORKSPACE_ROLES=1`."""
     r = (role or "").strip()
     if not r:
         return {}
     ws = os.path.abspath(workspace or ".")
-    for path in (
-        os.path.join(ws, ".mcp-agents", "roles.json"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "roles.json"),
-    ):
+    allow_ws_roles = os.environ.get("MCP_ALLOW_WORKSPACE_ROLES", "").strip() == "1"
+
+    search_paths = []
+    if allow_ws_roles:
+        search_paths.append(os.path.join(ws, ".mcp-agents", "roles.json"))
+    search_paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "roles.json"))
+
+    for path in search_paths:
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -255,91 +273,49 @@ def load_role(role: str, workspace: str = ".") -> dict:
                     return dict(data[r])
         except Exception:
             pass
-    md_path = os.path.join(ws, ".claude", "agents", f"{r}.md")
-    if os.path.isfile(md_path):
-        try:
-            with open(md_path, encoding="utf-8") as fh:
-                txt = fh.read()
-            if txt.startswith("---"):
-                _, _, body = txt.split("---", 2)
-                txt = body.strip()
-            return {"prompt": smart_truncate(txt, 1500)}
-        except Exception:
-            pass
+
+    if allow_ws_roles:
+        md_path = os.path.join(ws, ".claude", "agents", f"{r}.md")
+        if os.path.isfile(md_path):
+            try:
+                with open(md_path, encoding="utf-8") as fh:
+                    txt = fh.read()
+                if txt.startswith("---"):
+                    _, _, body = txt.split("---", 2)
+                    txt = body.strip()
+                return {"prompt": smart_truncate(txt, 1500)}
+            except Exception:
+                pass
     return {"prompt": f"Role: {r}. Stay strictly within this role."}
 
 
 def _run_prompt_hook(prompt: str, workspace: str, session_id: str = "") -> str:
-    """Optional workspace prompt hook (e.g. `.mcp-agents/prompt_hook.py` or `tools/claude_jev_prompt_hook.py`)."""
+    """Executes `<workspace>/.mcp-agents/prompt_hook.py` ONLY when `MCP_ALLOW_WORKSPACE_HOOKS=1`."""
+    if os.environ.get("MCP_ALLOW_WORKSPACE_HOOKS", "").strip() != "1":
+        return ""
     ws = os.path.abspath(workspace or ".")
-    for rel in (os.path.join(".mcp-agents", "prompt_hook.py"), os.path.join("tools", "claude_jev_prompt_hook.py")):
-        hp = os.path.join(ws, rel)
-        if not os.path.isfile(hp):
-            continue
-        try:
-            r = subprocess.run(
-                [sys.executable, hp],
-                cwd=ws,
-                input=json.dumps({"prompt": prompt, "session_id": session_id or "mcp_agents"}),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=6,
-            )
-            data = json.loads(r.stdout or "{}")
-            ctx = ((data.get("hookSpecificOutput") or {}).get("additionalContext") or "").strip()
-            if not ctx:
-                return ""
-            star_lines = [ln for ln in ctx.splitlines() if ln.lstrip().startswith("★")]
-            return smart_truncate("\n".join(star_lines) if star_lines else ctx, 600)
-        except Exception:
+    hp = os.path.join(ws, ".mcp-agents", "prompt_hook.py")
+    if not os.path.isfile(hp):
+        return ""
+    try:
+        r = subprocess.run(
+            [sys.executable, hp],
+            cwd=ws,
+            input=json.dumps({"prompt": prompt, "session_id": session_id or "mcp_agents"}),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=6,
+        )
+        data = json.loads(r.stdout or "{}")
+        ctx = ((data.get("hookSpecificOutput") or {}).get("additionalContext") or "").strip()
+        if not ctx:
             return ""
-    return ""
-
-
-def build_envelope(
-    prompt: str,
-    workspace: str = ".",
-    pkt_ref: str = "",
-    depth: int = 0,
-    max_depth: int = MAX_DEPTH,
-    target_cli: str = "",
-    role_prompt: str = "",
-    hook_context: str = "",
-    extra_warnings: list[str] | None = None,
-) -> str:
-    """Static-prefix-first envelope (prompt-cache friendly) with role, hook ctx, lazy @PKT, and [DELTA] lines."""
-    depth_note = " Final hop: do NOT delegate via agent_run; answer directly." if depth + 1 >= max_depth else ""
-    blocks = [
-        f"[POLICY depth={depth + 1}/{max_depth}] Use codebase-memory-mcp/graph before grep; prefer `rtk` for heavy shell output.{depth_note}"
-    ]
-    if role_prompt:
-        blocks.append(f"[ROLE] {role_prompt}")
-    if hook_context:
-        blocks.append(f"[HOOK_CTX] {hook_context}")
-    if pkt_ref:
-        ref = pkt_ref.strip()
-        if ref.startswith("@PKT|"):
-            # Lazy-loading: send only the compact 1-line @PKT; agent can call pkt_get(ref) if needed.
-            blocks.append(f"HANDOFF {ref}")
-        else:
-            payload = resolve_pkt_ref(ref, workspace=workspace)
-            if payload:
-                blocks.append(f"PKT_REF={ref}\n" + json.dumps(payload, ensure_ascii=False))
-            else:
-                blocks.append(f"PKT_REF={ref}")
-        target_files = _extract_pkt_files(ref, workspace)
-        deltas = get_recent_deltas(target_files, workspace=workspace, exclude_cli=target_cli)
-        if deltas:
-            blocks.append("\n".join(deltas))
-    if extra_warnings:
-        blocks.append("\n".join(extra_warnings))
-    blocks.append(prompt)
-    return "\n\n".join(blocks)
-
-
-_RECENT_CALLS: dict[tuple[str, str], int] = {}
+        star_lines = [ln for ln in ctx.splitlines() if ln.lstrip().startswith("★")]
+        return smart_truncate("\n".join(star_lines) if star_lines else ctx, 600)
+    except Exception:
+        return ""
 
 
 def _extract_pkt_files(pkt_ref: str, workspace: str) -> list[str]:
@@ -360,21 +336,63 @@ def _extract_pkt_files(pkt_ref: str, workspace: str) -> list[str]:
     return []
 
 
-def _git_changed_files(workspace: str) -> set[str]:
-    if not os.path.isdir(os.path.join(workspace, ".git")):
-        return set()
-    try:
-        r = subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True, timeout=4)
-        if r.returncode != 0:
-            return set()
-        return {ln[3:].strip() for ln in r.stdout.splitlines() if len(ln) > 3}
-    except Exception:
-        return set()
+def _extract_pkt_id(pkt_ref: str) -> str:
+    ref = (pkt_ref or "").strip()
+    if ref.startswith("@PKT|"):
+        parts = ref.split("|")
+        if len(parts) >= 2 and parts[1].strip():
+            return pkt_safe_id(parts[1])
+    if "#" in ref and not ref.startswith("@"):
+        return pkt_safe_id(ref.split("#", 1)[0])
+    return ""
+
+
+def build_envelope(
+    prompt: str,
+    workspace: str = ".",
+    pkt_ref: str = "",
+    depth: int = 0,
+    max_depth: int = MAX_DEPTH,
+    target_cli: str = "",
+    role_prompt: str = "",
+    hook_context: str = "",
+    extra_warnings: list[str] | None = None,
+) -> str:
+    """Static-prefix-first envelope (prompt-cache friendly) with role, lazy @PKT, JIT RepoMap, and [DELTA]."""
+    depth_note = " Final hop: do NOT delegate via agent_run; answer directly." if depth + 1 >= max_depth else ""
+    blocks = [
+        f"[POLICY depth={depth + 1}/{max_depth}] Use codebase-memory-mcp/graph before grep; prefer `rtk` for heavy shell output.{depth_note}"
+    ]
+    if role_prompt:
+        blocks.append(f"[ROLE] {role_prompt}")
+    if hook_context:
+        blocks.append(f"[HOOK_CTX] {hook_context}")
+    if pkt_ref:
+        ref = pkt_ref.strip()
+        if ref.startswith("@PKT|"):
+            blocks.append(f"HANDOFF {ref}")
+        else:
+            payload = resolve_pkt_ref(ref, workspace=workspace)
+            if payload:
+                blocks.append(f"PKT_REF={ref}\n" + json.dumps(payload, ensure_ascii=False))
+            else:
+                blocks.append(f"PKT_REF={ref}")
+        target_files = _extract_pkt_files(ref, workspace)
+        skeletons = [s for s in (file_skeleton(f, workspace=workspace) for f in target_files[:4]) if s]
+        if skeletons:
+            blocks.append("[REPOMAP] " + " | ".join(skeletons))
+        deltas = get_recent_deltas(target_files, workspace=workspace, exclude_cli=target_cli)
+        if deltas:
+            blocks.append("\n".join(deltas))
+    if extra_warnings:
+        blocks.append("\n".join(extra_warnings))
+    blocks.append(prompt)
+    return "\n\n".join(blocks)
 
 
 def _git_diff_hunks(workspace: str, files: list[str]) -> dict[str, str]:
     """Extracts compact `@@ ... @@` line ranges for changed files in a git repo."""
-    if not files or not os.path.isdir(os.path.join(workspace, ".git")):
+    if not files or not is_git_repo(workspace):
         return {}
     out: dict[str, str] = {}
     for f in files[:10]:
@@ -416,14 +434,21 @@ def run_cli(
     mode: str = "read",
     model: str = "",
     role: str = "",
+    task_id: str = "",
     timeout: int = DEFAULT_TIMEOUT,
     fallback: bool = True,
 ) -> dict:
-    """Executes a CLI headlessly, returning text, session_id, cli used, and rc."""
+    """Executes a CLI headlessly. Never escalates `mode` via role; falls back ONLY on rate-limit errors."""
     ws = os.path.abspath(workspace or ".")
     role_cfg = load_role(role, workspace=ws) if role else {}
-    if role_cfg.get("mode") and mode == "read":
-        mode = str(role_cfg["mode"])
+
+    # Security: NEVER allow a role to promote `read` -> `work`; a role may only restrict `work` -> `read`.
+    requested_work = str(mode).lower() == "work"
+    if requested_work and str(role_cfg.get("mode") or "").lower() == "read":
+        eff_mode = "read"
+    else:
+        eff_mode = "work" if requested_work else "read"
+
     if role_cfg.get("model") and not model:
         model = str(role_cfg["model"])
 
@@ -451,8 +476,13 @@ def run_cli(
     else:
         eff_sid = ""
 
-    work = str(mode).lower() == "work"
-    lock_owner = f"{actor}:{os.getpid()}"
+    work = eff_mode == "work"
+    eff_task_id = pkt_safe_id(task_id) if task_id else (_extract_pkt_id(pkt_ref) or f"RUN-{int(time.time())}")
+    if work:
+        ensure_base_commit(eff_task_id, workspace=ws)
+
+    # Unique per-invocation token so simultaneous runs of the same actor inside one server process still conflict
+    lock_owner = f"{actor}:{uuid.uuid4().hex[:8]}"
     locked_files: list[str] = []
     warnings: list[str] = []
     if work and pkt_ref:
@@ -460,7 +490,6 @@ def run_cli(
         if locked_files:
             ok_lock, conflicts = acquire_locks(lock_owner, locked_files, workspace=ws, cli=actor)
             if not ok_lock:
-                # Advisory non-blocking warning so collaborative edits are never deadlocked
                 warnings.append("[CONCURRENT_EDIT] " + "; ".join(f"{c.get('file')} active by {c.get('cli')}" for c in conflicts))
                 locked_files = []
 
@@ -497,12 +526,20 @@ def run_cli(
                 continue
             cand_actor = f"{cand}:{role}" if role else cand
             env["MCP_AGENTS_CHAIN"] = ">".join(chain_env + [cand_actor])
-            raw_cmd = build_cmd(cand, full_prompt, workspace=ws, mode=mode, model=model if cand == cli else "", session_id=eff_sid if cand == cli else "")
+            raw_cmd = build_cmd(
+                cand,
+                full_prompt,
+                workspace=ws,
+                mode=eff_mode,
+                model=model if cand == cli else "",
+                session_id=eff_sid if cand == cli else "",
+            )
             cmd = resolve_exe(raw_cmd)
             if not cmd:
                 last_err = f"'{_env_bin(cand)}' not found in PATH"
-                continue
-            files_before = _git_changed_files(ws) if work else set()
+                break
+
+            snap_before = snapshot_worktree(ws) if work else {}
             t0 = time.time()
             try:
                 proc = subprocess.run(
@@ -517,27 +554,31 @@ def run_cli(
                     timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
-                _log_metric(ws, cand, mode, False, time.time() - t0, len(full_prompt), pkt_len, 0)
+                _log_metric(ws, cand, eff_mode, False, time.time() - t0, len(full_prompt), pkt_len, 0)
                 last_err = f"{cand} timed out after {timeout}s"
-                continue
+                break
             except Exception as exc:
-                _log_metric(ws, cand, mode, False, time.time() - t0, len(full_prompt), pkt_len, 0)
+                _log_metric(ws, cand, eff_mode, False, time.time() - t0, len(full_prompt), pkt_len, 0)
                 last_err = f"{cand} failed: {exc}"
-                continue
+                break
 
             dur = time.time() - t0
             if _is_limit_error(proc.stdout, proc.stderr, proc.returncode):
                 _COOLDOWNS[cand] = time.time() + 180
-                _log_metric(ws, cand, mode, False, dur, len(full_prompt), pkt_len, 0)
+                _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, 0)
                 last_err = (proc.stderr or proc.stdout or "rate limit")[-200:]
-                continue
+                if fallback and not eff_sid:
+                    continue
+                break
 
             text, out_sid = _extract_json_response(proc.stdout)
-            changed = sorted(_git_changed_files(ws) - files_before) if work else []
+            snap_after = snapshot_worktree(ws) if work else {}
+            changed = diff_worktree_snapshots(ws, snap_before, snap_after) if work else []
             if work and changed:
                 record_deltas(cand_actor, _git_diff_hunks(ws, changed), workspace=ws)
+
             if proc.returncode == 0 and (text or changed):
-                _log_metric(ws, cand, mode, True, dur, len(full_prompt), pkt_len, len(text))
+                _log_metric(ws, cand, eff_mode, True, dur, len(full_prompt), pkt_len, len(text))
                 final_sid = out_sid or (eff_sid if cand == cli else "")
                 if role and final_sid:
                     save_role_session(cand, role, final_sid, workspace=ws)
@@ -545,19 +586,29 @@ def run_cli(
                     "ok": True,
                     "cli": cand,
                     "role": role,
+                    "mode": eff_mode,
                     "rc": 0,
                     "session_id": final_sid,
                     "output": smart_truncate(text or "(files modified)", 8000),
                 }
                 if changed:
                     res["changed_files"] = changed
+                if work:
+                    res["pkt"] = build_pkt_from_git(
+                        task_id=eff_task_id,
+                        workspace=ws,
+                        cli=cand,
+                        delegated=(cand != cli),
+                        explicit_files=changed,
+                    )
                 return res
-            _log_metric(ws, cand, mode, False, dur, len(full_prompt), pkt_len, len(text))
+
+            _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, len(text))
             last_err = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-400:]
-            if not fallback or eff_sid:
-                break
+            # Never fall back on non-rate-limit failures!
+            break
     finally:
         if locked_files:
             release_locks(lock_owner, workspace=ws, files=locked_files)
 
-    return {"ok": False, "cli": cli, "rc": 1, "error": last_err or "No available CLI succeeded."}
+    return {"ok": False, "cli": cli, "rc": 1, "error": last_err or "CLI execution failed."}

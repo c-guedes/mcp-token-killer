@@ -1,26 +1,33 @@
-"""Lean plug-and-play MCP server for @PKT handoffs and multi-CLI orchestration."""
+"""mcp-token-killer: Git-backed @PKT handoffs and multi-CLI orchestration over MCP."""
 from __future__ import annotations
 
 import json
 import os
 import sys
 
-# Ensure local imports work regardless of caller cwd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.mcpserver import MCPServer
 
 from cli_gateway import list_clis, run_cli
-from pkt_core import PktValidationError, default_store_path, encode_packet, load_pkt_refs, resolve_pkt_ref
+from pkt_core import (
+    PktValidationError,
+    build_pkt_from_git,
+    default_store_path,
+    ensure_base_commit,
+    load_pkt_refs,
+    resolve_pkt_ref,
+)
 from rtk_exec import run_rtk_cmd
 
 _INSTRUCTIONS = (
-    "Use `agent_run` to delegate to another CLI or role (pass `pkt_ref` for context, `session_id` to resume). "
-    "Use `pkt_save` after edits to create a compact @PKT handoff, and `pkt_get` only if a `ref=` needs expansion. "
-    "Prefer `rtk_run` over raw shell for builds, diffs, grep, and logs."
+    "Use `agent_run` to delegate to another CLI or role (`pkt_ref` for context, `session_id` to resume; "
+    "in `work` mode it records `base_commit` and returns a Git-extracted `pkt`). "
+    "Use `pkt_save` to attach `handoff_why`/`handoff_next` (and optional `qa_status`) onto Git-extracted facts; "
+    "use `pkt_get` only when a `ref=` needs expansion. Prefer `rtk_run` for builds, diffs, grep, and logs."
 )
 
-mcp = MCPServer("mcp-agents", instructions=_INSTRUCTIONS)
+mcp = MCPServer("mcp-token-killer", instructions=_INSTRUCTIONS)
 
 
 @mcp.tool()
@@ -33,6 +40,7 @@ def agent_run(
     mode: str = "read",
     model: str = "",
     role: str = "",
+    task_id: str = "",
     fallback: bool = True,
 ) -> str:
     """Run/resume a CLI agent (grok|codex|claude|gemini|opencode|agy) with optional role & @PKT, or cli='status'."""
@@ -49,6 +57,7 @@ def agent_run(
         mode=mode,
         model=model,
         role=role,
+        task_id=task_id,
         fallback=fallback,
     )
     return json.dumps(res, ensure_ascii=False)
@@ -57,33 +66,32 @@ def agent_run(
 @mcp.tool()
 def pkt_save(
     id: str,
-    touched_files: list[str] | None = None,
-    interface_contracts: list[str] | None = None,
     handoff_why: str = "",
     handoff_next: str = "",
     workspace: str = ".",
     op: str = "HND",
     status: str = "doing",
     cli: str = "-",
-    always_store: bool = True,
+    qa_status: str = "",
+    claim: bool = False,
 ) -> str:
-    """Validate and encode a @PKT handoff line, storing full payload in pkt_refs.json."""
+    """Build a @PKT line from real Git diff (`f=` and `api=` extracted from Git, never LLM-invented).
+
+    Pass `claim=True` before starting work on `id` to pin `base_commit` to current HEAD.
+    """
     try:
-        pkt = encode_packet(
-            {
-                "id": id,
-                "status": status,
-                "cli": cli,
-                "touched_files": touched_files or [],
-                "interface_contracts": interface_contracts or [],
-                "handoff_why": handoff_why,
-                "handoff_next": handoff_next,
-            },
-            op=op,
+        if claim:
+            ensure_base_commit(id, workspace=workspace)
+        return build_pkt_from_git(
+            task_id=id,
             workspace=workspace,
-            always_store=always_store,
+            handoff_why=handoff_why,
+            handoff_next=handoff_next,
+            op=op,
+            status=status,
+            cli=cli,
+            qa_status=qa_status,
         )
-        return pkt
     except PktValidationError as exc:
         return f"@PKT|{id}|{status}|{cli}|[INVALID]|op=ERR|why={exc}"
 

@@ -1,4 +1,4 @@
-"""Lean RTK command rewriter & executor (ported from E:\\godot jogo\\tools\\claude_rtk_extra.py)."""
+"""Lean RTK command rewriter & executor for token-compact shell output."""
 from __future__ import annotations
 
 import os

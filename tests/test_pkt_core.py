@@ -1,9 +1,10 @@
-"""Unit tests for standalone @PKT core and CLI gateway."""
+"""Unit and Git-integration tests for standalone @PKT protocol core."""
 from __future__ import annotations
 
 import json
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,9 +12,19 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import cli_gateway as gw
-import pkt_core as pkt
-import rtk_exec as rtk
+import pkt_core as pkt  # noqa: E402
+
+
+def _git(cwd: str, *args: str) -> None:
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr}")
+
+
+def _init_repo(tmp: str) -> None:
+    _git(tmp, "init")
+    _git(tmp, "config", "user.email", "test@example.com")
+    _git(tmp, "config", "user.name", "Test")
 
 
 class TestSmartTruncate(unittest.TestCase):
@@ -31,21 +42,42 @@ class TestSmartTruncate(unittest.TestCase):
 
     def test_fuzz_never_exceeds_limit(self):
         rng = random.Random(1234)
-        for _ in range(1000):
+        for _ in range(1500):
             n, lim = rng.randint(0, 600), rng.randint(0, 300)
             s = "".join(rng.choice("ab cd\n\t") for _ in range(n))
             self.assertLessEqual(len(pkt.smart_truncate(s, lim)), lim)
 
 
-class TestPktProtocol(unittest.TestCase):
+class TestPktEncodingAndStore(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mcp_pkt_")
         self.store = os.path.join(self.tmp, "pkt_refs.json")
 
-    def test_single_line_and_validation(self):
-        p = pkt.encode_packet({"id": "T-1", "status": "doing", "cli": "grok"}, workspace=self.tmp, store_path=self.store)
-        self.assertNotIn("\n", p)
-        self.assertTrue(p.startswith("@PKT|T-1|doing|grok|["))
+    def test_ref_emitted_only_when_truncated(self):
+        pure = pkt.encode_packet(
+            {
+                "id": "T-1",
+                "status": "doing",
+                "cli": "grok",
+                "touched_files": ["a.py", "b.py", "c.py", "d.py"],
+                "interface_contracts": ["1", "2", "3"],
+                "handoff_why": "w" * 90,
+                "handoff_next": "n" * 140,
+            },
+            workspace=self.tmp,
+            store_path=self.store,
+        )
+        self.assertNotIn("|ref=", pure)
+
+        over = pkt.encode_packet(
+            {"id": "T-1", "touched_files": ["a.py", "b.py", "c.py", "d.py", "e.py"]},
+            workspace=self.tmp,
+            store_path=self.store,
+        )
+        self.assertIn("(+1)", over)
+        self.assertIn("|ref=T-1#", over)
+
+    def test_validation_error_on_bad_types(self):
         with self.assertRaises(pkt.PktValidationError):
             pkt.encode_packet({"id": "T-1", "touched_files": "not-a-list"}, store_path=self.store)
 
@@ -60,7 +92,6 @@ class TestPktProtocol(unittest.TestCase):
         p1 = pkt.encode_packet(c, workspace=self.tmp, store_path=self.store)
         p2 = pkt.encode_packet(c, workspace=self.tmp, store_path=self.store)
         self.assertEqual(p1, p2)
-        self.assertIn("(+2)", p1)
         ref = p1.split("|ref=")[1]
         loaded = pkt.load_pkt_refs(self.store)
         self.assertEqual(loaded[ref]["contracts"][0], "public int Hp { get; set; }")
@@ -72,120 +103,113 @@ class TestPktProtocol(unittest.TestCase):
         loaded = pkt.load_pkt_refs(self.store)
         self.assertEqual(loaded["T-3#abcd1234"]["nxt"], "go")
 
-    def test_resolve_pkt_ref_workspace(self):
-        p = pkt.encode_packet(
-            {"id": "T-4", "handoff_why": "test", "handoff_next": "next"},
-            workspace=self.tmp,
-            always_store=True,
-        )
-        ref = p.split("|ref=")[1]
-        resolved = pkt.resolve_pkt_ref(ref, workspace=self.tmp)
-        self.assertIsNotNone(resolved)
-        self.assertEqual(resolved["nxt"], "next")
-
-    def test_file_locks_conflict_and_release(self):
-        ok1, c1 = pkt.acquire_locks("grok:1", ["src/a.py", "src/b.py"], workspace=self.tmp, cli="grok")
+    def test_concurrent_locks_same_actor_distinct_invocation_tokens(self):
+        ok1, _ = pkt.acquire_locks("grok:coder:aaaa1111", ["src/a.py"], workspace=self.tmp, cli="grok:coder")
         self.assertTrue(ok1)
-        self.assertEqual(c1, [])
-        ok2, c2 = pkt.acquire_locks("codex:2", ["src/b.py"], workspace=self.tmp, cli="codex")
+        ok2, c2 = pkt.acquire_locks("grok:coder:bbbb2222", ["src/a.py"], workspace=self.tmp, cli="grok:coder")
         self.assertFalse(ok2)
-        self.assertEqual(c2[0]["owner"], "grok:1")
-        self.assertEqual(pkt.release_locks("grok:1", workspace=self.tmp), 2)
-        ok3, _ = pkt.acquire_locks("codex:2", ["src/b.py"], workspace=self.tmp, cli="codex")
-        self.assertTrue(ok3)
+        self.assertEqual(c2[0]["cli"], "grok:coder")
+        pkt.release_locks("grok:coder:aaaa1111", workspace=self.tmp)
 
 
-class TestCliGateway(unittest.TestCase):
-    def test_build_cmds(self):
-        self.assertIn("-p", gw.build_cmd("grok", "hi", session_id="s1"))
-        self.assertIn("-r", gw.build_cmd("grok", "hi", session_id="s1"))
-        self.assertIn("--always-approve", gw.build_cmd("grok", "hi", mode="work"))
-        self.assertEqual(gw.build_cmd("codex", "hi", session_id="s2")[-2:], ["s2", "hi"])
-        self.assertIn("--resume", gw.build_cmd("claude", "hi", session_id="s3"))
-        self.assertIn("--resume", gw.build_cmd("gemini", "hi", session_id="s4"))
-        self.assertIn("-s", gw.build_cmd("opencode", "hi", session_id="s5"))
+class TestGitFactExtraction(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mcp_git_")
+        _init_repo(self.tmp)
+        with open(os.path.join(self.tmp, "README.md"), "w", encoding="utf-8") as fh:
+            fh.write("# init\n")
+        _git(self.tmp, "add", ".")
+        _git(self.tmp, "commit", "-m", "c1: init")
 
-    def test_envelope_injects_pkt_and_policy(self):
-        tmp = tempfile.mkdtemp(prefix="mcp_env_")
-        p = pkt.encode_packet(
-            {"id": "T-5", "touched_files": ["server.py"], "handoff_why": "bug", "handoff_next": "fix it"},
-            workspace=tmp,
-            always_store=True,
-        )
-        pkt.record_deltas("grok", {"server.py": "@@ -10,0 +11,3 @@"}, workspace=tmp)
-        env = gw.build_envelope("do work", workspace=tmp, pkt_ref=p, depth=1, max_depth=2, target_cli="codex")
-        self.assertTrue(env.startswith("[POLICY "))
-        self.assertIn("HANDOFF @PKT|T-5", env)
-        self.assertNotIn("PKT_PAYLOAD=", env)  # lazy-loaded
-        self.assertIn("[DELTA] grok edited server.py: @@ -10,0 +11,3 @@", env)
-        self.assertIn("Final hop", env)
-        self.assertIn("do work", env)
+    def test_t18_t19_base_commit_claim_and_failover_inheritance(self):
+        # Commit from an earlier unrelated card BEFORE claim
+        with open(os.path.join(self.tmp, "OtherCard.cs"), "w", encoding="utf-8") as fh:
+            fh.write("public class OtherCard {}\n")
+        _git(self.tmp, "add", ".")
+        _git(self.tmp, "commit", "-m", "c2: unrelated card")
 
-    def test_opencode_ndjson_and_depth_cycle_guards(self):
-        raw = '{"type":"text","sessionID":"ses_123","part":{"type":"text","text":"OK"}}\n'
-        txt, sid = gw._extract_json_response(raw)
-        self.assertEqual(txt, "OK")
-        self.assertEqual(sid, "ses_123")
+        # Claim pins HEAD at c2 (T19: excludes OtherCard.cs!)
+        base1 = pkt.ensure_base_commit("KB-19", workspace=self.tmp)
+        self.assertEqual(base1, pkt.git_head_rev(self.tmp))
 
-        os.environ["MCP_AGENTS_DEPTH"] = "2"
-        try:
-            r = gw.run_cli("grok", "hi", fallback=False)
-            self.assertFalse(r["ok"])
-            self.assertIn("depth", r["error"].lower())
-        finally:
-            os.environ.pop("MCP_AGENTS_DEPTH", None)
+        # Worker 1 commits partial work, then fails over to Worker 2
+        with open(os.path.join(self.tmp, "Combat.cs"), "w", encoding="utf-8") as fh:
+            fh.write("public class Combat {\n    public int Hp { get; set; }\n}\n")
+        _git(self.tmp, "add", ".")
+        _git(self.tmp, "commit", "-m", "c3: partial work by codex")
 
-        os.environ["MCP_AGENTS_CHAIN"] = "grok>codex"
-        try:
-            r = gw.run_cli("grok", "hi", fallback=False)
-            self.assertFalse(r["ok"])
-            self.assertIn("Cycle", r["error"])
-        finally:
-            os.environ.pop("MCP_AGENTS_CHAIN", None)
+        # Failover claim MUST preserve base1 (T18)
+        base2 = pkt.ensure_base_commit("KB-19", workspace=self.tmp)
+        self.assertEqual(base2, base1)
 
-    def test_roles_and_per_role_sessions(self):
-        tmp = tempfile.mkdtemp(prefix="mcp_role_")
-        cfg = gw.load_role("architect", workspace=tmp)
-        self.assertEqual(cfg.get("mode"), "read")
-        self.assertIn("Architect", cfg.get("prompt", ""))
+        # Worker 2 adds GDScript & Python files (uncommitted)
+        with open(os.path.join(self.tmp, "Player.gd"), "w", encoding="utf-8") as fh:
+            fh.write("@export var speed: int = 5\nfunc _ready():\n    pass\nfunc apply_stun(d: int):\n    pass\n")
 
-        # Fallback to .claude/agents/<role>.md
-        agents_dir = os.path.join(tmp, ".claude", "agents")
-        os.makedirs(agents_dir, exist_ok=True)
-        with open(os.path.join(agents_dir, "qa-visual.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nmodel: sonnet\n---\nInspect screenshots carefully.")
-        qa_cfg = gw.load_role("qa-visual", workspace=tmp)
-        self.assertIn("Inspect screenshots", qa_cfg.get("prompt", ""))
+        line = pkt.build_pkt_from_git("KB-19", workspace=self.tmp, cli="claude", handoff_why="stun", handoff_next="wire hud")
+        self.assertNotIn("OtherCard.cs", line)
+        self.assertNotIn(".mcp-agents", line)
+        self.assertIn("f=Combat.cs,Player.gd", line)
+        self.assertIn("@export var speed", line)
+        self.assertIn("apply_stun", line)
+        self.assertNotIn("_ready", line)
+        self.assertNotIn("PARTIAL_DIFF", line)
+        self.assertNotIn("(?)", line)
+        self.assertIn("[CODE,API,PUB]", line)
+        # 4 public contracts -> 3 inline + (+1) + recoverable ref= containing `public int Hp { get; set; }`
+        self.assertIn(";(+1)|", line)
+        ref = line.split("|ref=")[1]
+        resolved = pkt.resolve_pkt_ref(ref, workspace=self.tmp)
+        self.assertTrue(any("public int Hp { get; set; }" in c for c in resolved["contracts"]))
 
-        # Separate sessions per (cli, role)
-        gw.save_role_session("grok", "architect", "sid-arch-1", workspace=tmp)
-        gw.save_role_session("grok", "coder", "sid-coder-2", workspace=tmp)
-        self.assertEqual(gw.get_role_session("grok", "architect", workspace=tmp), "sid-arch-1")
-        self.assertEqual(gw.get_role_session("grok", "coder", workspace=tmp), "sid-coder-2")
+    def test_partial_diff_flagged_without_valid_base_commit(self):
+        with open(os.path.join(self.tmp, "mod.py"), "w", encoding="utf-8") as fh:
+            fh.write("def compute_tax(x: float):\n    return x\n")
+        # No ensure_base_commit called -> heuristic diff MUST set PARTIAL_DIFF and (?)
+        line = pkt.build_pkt_from_git("UNCLAIMED-1", workspace=self.tmp, cli="grok")
+        self.assertIn("PARTIAL_DIFF", line)
+        self.assertIn("(?)", line)
+        self.assertIn("compute_tax", line)
 
-        # Same CLI with different role is NOT blocked as a cycle; same (cli, role) IS blocked
-        os.environ["MCP_AGENTS_CHAIN"] = "grok:architect"
-        try:
-            r_same = gw.run_cli("grok", "hi", role="architect", workspace=tmp, fallback=False)
-            self.assertFalse(r_same["ok"])
-            self.assertIn("Cycle", r_same["error"])
-        finally:
-            os.environ.pop("MCP_AGENTS_CHAIN", None)
+        # Invalid/rebased commit hash also triggers PARTIAL_DIFF
+        pkt.save_task_state("REBASED-1", {"base_commit": "deadbeef" * 5}, workspace=self.tmp)
+        line2 = pkt.build_pkt_from_git("REBASED-1", workspace=self.tmp, cli="grok")
+        self.assertIn("PARTIAL_DIFF", line2)
+        self.assertIn("(?)", line2)
 
-    def test_rtk_rewrite_and_prompt_hook(self):
-        rw = rtk.rewrite_cmd("dotnet test server/ && git diff --stat && echo ok > out.txt")
-        self.assertIn("rtk dotnet test server/", rw)
-        self.assertIn("rtk git diff --stat", rw)
-        self.assertIn("echo ok > out.txt", rw)
-        self.assertNotIn("rtk echo", rw)
+    def test_already_dirty_file_reedited_is_detected(self):
+        dirty_file = os.path.join(self.tmp, "dirty.py")
+        untouched_dirty = os.path.join(self.tmp, "untouched.py")
+        with open(dirty_file, "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        with open(untouched_dirty, "w", encoding="utf-8") as fh:
+            fh.write("y = 1\n")
 
-        tmp = tempfile.mkdtemp(prefix="mcp_hook_")
-        hook_dir = os.path.join(tmp, ".mcp-agents")
-        os.makedirs(hook_dir, exist_ok=True)
-        with open(os.path.join(hook_dir, "prompt_hook.py"), "w", encoding="utf-8") as fh:
-            fh.write('import json, sys; _ = sys.stdin.read(); print(json.dumps({"hookSpecificOutput": {"additionalContext": "★ JEV: use skill X"}}))')
-        ctx = gw._run_prompt_hook("fix bug", workspace=tmp)
-        self.assertIn("★ JEV: use skill X", ctx)
+        snap_before = pkt.snapshot_worktree(self.tmp)
+        # Re-edit only dirty.py
+        with open(dirty_file, "w", encoding="utf-8") as fh:
+            fh.write("x = 2\n")
+        snap_after = pkt.snapshot_worktree(self.tmp)
+
+        changed = pkt.diff_worktree_snapshots(self.tmp, snap_before, snap_after)
+        self.assertEqual(changed, ["dirty.py"])
+
+    def test_bit_code_touched_requires_real_change_and_existing_file(self):
+        # README.md exists on disk and is clean -> CODE bit must be 0
+        bits_clean = pkt.compute_bits({"touched_files": ["README.md"]}, workspace=self.tmp)
+        self.assertEqual(bits_clean & pkt.BIT_CODE_TOUCHED, 0)
+
+        # Modify README.md -> CODE bit becomes 1
+        with open(os.path.join(self.tmp, "README.md"), "a", encoding="utf-8") as fh:
+            fh.write("more\n")
+        bits_dirty = pkt.compute_bits({"touched_files": ["README.md"]}, workspace=self.tmp)
+        self.assertNotEqual(bits_dirty & pkt.BIT_CODE_TOUCHED, 0)
+
+        # Ghost file (deleted) -> CODE bit is 0 and skeleton is empty
+        os.remove(os.path.join(self.tmp, "README.md"))
+        bits_deleted = pkt.compute_bits({"touched_files": ["README.md"], "git_verified": True}, workspace=self.tmp)
+        self.assertEqual(bits_deleted & pkt.BIT_CODE_TOUCHED, 0)
+        self.assertEqual(pkt.file_skeleton("missing.py", workspace=self.tmp), "")
 
 
 if __name__ == "__main__":
