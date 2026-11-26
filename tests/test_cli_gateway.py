@@ -100,7 +100,7 @@ class TestGatewaySecurity(unittest.TestCase):
                 res = gw.run_cli("grok", "inspect", workspace=tmp, mode="read", role="evil", fallback=False)
             self.assertTrue(res["ok"])
             self.assertEqual(res["mode"], "read")
-            self.assertNotIn("--always-approve", captured_cmds[0])
+            self.assertIn("--disallowed-tools", captured_cmds[0])
 
             # Built-in `coder` has `"mode": "work"`, yet calling `run_cli(..., mode="read", role="coder")` stays `read`!
             captured_cmds.clear()
@@ -108,7 +108,7 @@ class TestGatewaySecurity(unittest.TestCase):
                  mock.patch("cli_gateway.subprocess.run", side_effect=fake_run):
                 res2 = gw.run_cli("grok", "inspect2", workspace=tmp, mode="read", role="coder", fallback=False)
             self.assertEqual(res2["mode"], "read")
-            self.assertNotIn("--always-approve", captured_cmds[0])
+            self.assertIn("--disallowed-tools", captured_cmds[0])
         finally:
             os.environ.pop("MCP_ALLOW_WORKSPACE_ROLES", None)
 

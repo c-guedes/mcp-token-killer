@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -28,7 +29,7 @@ from pkt_core import (
 )
 
 MAX_DEPTH = 2
-DEFAULT_TIMEOUT = 180
+DEFAULT_TIMEOUT = 300
 DEFAULT_CHAIN = ("grok", "codex", "opencode", "claude", "gemini", "agy")
 
 _NPM_JS_TARGETS = {
@@ -89,9 +90,10 @@ def build_cmd(
     ws = os.path.abspath(workspace or ".")
 
     if cli == "grok":
-        cmd = [bin_name, "--cwd", ws, "--output-format", "json"]
-        if work:
-            cmd.append("--always-approve")
+        sock = os.path.join(tempfile.gettempdir(), f"grok_mcp_{uuid.uuid4().hex[:10]}.sock")
+        cmd = [bin_name, "--leader-socket", sock, "--cwd", ws, "--output-format", "json", "--always-approve"]
+        if not work:
+            cmd += ["--disallowed-tools", "Edit,Write,MultiEdit,Bash,NotebookEdit"]
         if model:
             cmd += ["-m", model]
         if session_id:
@@ -103,6 +105,8 @@ def build_cmd(
         cmd = [bin_name, "exec", "--skip-git-repo-check"]
         if work:
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            cmd += ["-s", "read-only"]
         if model:
             cmd += ["-m", model]
         if session_id:
@@ -115,11 +119,13 @@ def build_cmd(
         cmd = [bin_name, "-p", "--exclude-dynamic-system-prompt-sections", "--output-format", "json"]
         if work:
             cmd.append("--dangerously-skip-permissions")
+        else:
+            cmd += ["--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob"]
         if model:
             cmd += ["--model", model]
         if session_id:
             cmd += ["--resume", session_id]
-        cmd.append(prompt)
+        cmd += ["--", prompt]
         return cmd
 
     if cli == "gemini":
@@ -187,6 +193,8 @@ def _extract_json_response(raw: str) -> tuple[str, str]:
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
+            if obj.get("is_error"):
+                return "", str(obj.get("session_id") or obj.get("sessionId") or "")
             txt = obj.get("result") or obj.get("response") or obj.get("text") or obj.get("content") or ""
             sid = obj.get("session_id") or obj.get("sessionId") or obj.get("sessionID") or ""
             if isinstance(txt, str) and txt:
@@ -569,7 +577,7 @@ def run_cli(
             if _is_limit_error(proc.stdout, proc.stderr, proc.returncode):
                 _COOLDOWNS[cand] = time.time() + 180
                 _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, 0)
-                last_err = (proc.stderr or proc.stdout or "rate limit")[-200:]
+                last_err = smart_truncate(proc.stderr or proc.stdout or "rate limit", 400)
                 if fallback and not eff_sid:
                     continue
                 break
@@ -609,7 +617,7 @@ def run_cli(
                 return res
 
             _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, len(text))
-            last_err = (proc.stderr or proc.stdout or f"rc={proc.returncode}")[-400:]
+            last_err = smart_truncate(proc.stderr or proc.stdout or f"rc={proc.returncode}", 400)
             # Never fall back on non-rate-limit failures!
             break
     finally:
