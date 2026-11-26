@@ -167,22 +167,33 @@ class TestGatewaySecurity(unittest.TestCase):
 
         tmp = tempfile.mkdtemp(prefix="srv_pkt_")
         _init_repo(tmp)
-        # Claim first, then edit
+        # Claim first, commit change -> exact @PKT (no PARTIAL_DIFF)
         server.pkt_save("T-99", workspace=tmp, claim=True)
         with open(os.path.join(tmp, "mod.py"), "w", encoding="utf-8") as fh:
             fh.write("def export_data(items: list):\n    return len(items)\n")
+        subprocess.run(["git", "add", "mod.py"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "add mod"], cwd=tmp, capture_output=True, check=True)
         out = server.pkt_save("T-99", handoff_why="export added", handoff_next="add cli flag", workspace=tmp, qa_status="PASS")
         self.assertIn("|f=mod.py|", out)
         self.assertIn("export_data", out)
         self.assertIn("QA_PASS", out)
         self.assertNotIn("PARTIAL_DIFF", out)
 
+        # Uncommitted external file `outro.gd` after claim -> NEVER appears without `(?)`!
+        server.pkt_save("T-100", workspace=tmp, claim=True)
+        with open(os.path.join(tmp, "outro.gd"), "w", encoding="utf-8") as fh:
+            fh.write("func stealth():\n    pass\n")
+        out_dirty = server.pkt_save("T-100", workspace=tmp)
+        self.assertFalse("outro.gd" in out_dirty and "(?)" not in out_dirty)
+        self.assertIn("PARTIAL_DIFF", out_dirty)
+        self.assertIn("(?)", out_dirty)
+
     def test_envelope_repomap_delta_and_rtk(self):
         tmp = tempfile.mkdtemp(prefix="env_rm_")
         _init_repo(tmp)
+        pkt.ensure_base_commit("T-RM", workspace=tmp)
         with open(os.path.join(tmp, "engine.py"), "w", encoding="utf-8") as fh:
             fh.write("class Engine:\n    def start(self):\n        pass\n")
-        pkt.ensure_base_commit("T-RM", workspace=tmp)
         p = pkt.build_pkt_from_git("T-RM", workspace=tmp, handoff_next="call start")
         pkt.record_deltas("grok", {"engine.py": "@@ -0,0 +1,3 @@"}, workspace=tmp)
 

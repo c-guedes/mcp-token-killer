@@ -195,21 +195,57 @@ def save_task_state(task_id: str, patch: dict, workspace: str = ".") -> dict:
 
 
 def ensure_base_commit(task_id: str, workspace: str = ".") -> str:
-    """Records HEAD on first task claim; preserves existing `base_commit` across failovers (T18/T19)."""
+    """Records HEAD and pre-existing dirty/untracked `baseline_snap` on first claim; preserves across failovers."""
     if not task_id:
         return ""
     tid = pkt_safe_id(task_id)
     ws = os.path.abspath(workspace or ".")
     tasks = load_tasks(ws)
-    existing = str((tasks.get(tid) or {}).get("base_commit") or "").strip()
+    cur = tasks.get(tid) or {}
+    existing = str(cur.get("base_commit") or "").strip()
     if existing:
         return existing
     if not is_git_repo(ws):
         return ""
     rev = git_head_rev(ws)
     if rev:
-        save_task_state(tid, {"base_commit": rev, "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%S")}, workspace=ws)
+        base_snap = snapshot_worktree(ws)
+        base_snap.pop("__HEAD__", None)
+        save_task_state(
+            tid,
+            {
+                "base_commit": rev,
+                "baseline_snap": base_snap,
+                "owned_files": list(cur.get("owned_files") or []),
+                "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            },
+            workspace=ws,
+        )
     return rev
+
+
+def record_task_owned_files(
+    task_id: str,
+    files: list[str],
+    workspace: str = ".",
+    lock_conflict: bool = False,
+) -> None:
+    """Records files proven changed during an `agent_run` window for `task_id`."""
+    if not task_id:
+        return
+    tid = pkt_safe_id(task_id)
+    ws = os.path.abspath(workspace or ".")
+    tasks = load_tasks(ws)
+    cur = tasks.get(tid) or {}
+    owned = set(cur.get("owned_files") or [])
+    for f in files or []:
+        nf = str(f).replace("\\", "/").strip()
+        if nf and not _is_internal_meta(nf):
+            owned.add(nf)
+    patch: dict = {"owned_files": sorted(owned)}
+    if lock_conflict or cur.get("lock_conflict"):
+        patch["lock_conflict"] = True
+    save_task_state(tid, patch, workspace=ws)
 
 
 def _is_internal_meta(rel_path: str) -> bool:
@@ -297,56 +333,115 @@ def extract_contracts_from_diff(diff_text: str) -> list[str]:
     return contracts
 
 
-def extract_git_facts(workspace: str = ".", task_id: str = "", base_commit: str = "", explicit_files: list[str] | None = None) -> dict:
-    """Extracts `(touched_files, interface_contracts, diff_partial, git_verified)` directly from Git.
+def _active_foreign_locked_files(workspace: str, exclude_owner: str = "") -> set[str]:
+    locks = _load_locks(_locks_path(workspace))
+    out: set[str] = set()
+    for f_norm, info in locks.items():
+        owner = str(info.get("owner") or "")
+        if not exclude_owner or owner != exclude_owner:
+            out.add(f_norm)
+    return out
 
-    `diff_partial` is False ONLY when diffing against a recorded, validated `base_commit`.
+
+def extract_git_facts(
+    workspace: str = ".",
+    task_id: str = "",
+    base_commit: str = "",
+    explicit_files: list[str] | None = None,
+    lock_owner: str = "",
+) -> dict:
+    """Extracts `(touched_files, interface_contracts, diff_partial, git_verified)` from Git without silent over-inclusion.
+
+    Invariants:
+    1. Files already dirty/untracked at claim (`baseline_snap`) with unchanged hash are subtracted.
+    2. When `explicit_files` or task `owned_files` (measured by `agent_run` snapshots) exist, `f=` comes from
+       that exact set rather than sweeping unrelated working-tree files.
+    3. Unmonitored uncommitted worktree files (e.g. standalone `pkt_save` where another process may have written
+       to the shared worktree), pre-claim dirty files re-edited, or intersections with active foreign locks
+       always set `diff_partial=True` (`PARTIAL_DIFF` + `(?)`).
     """
     ws = os.path.abspath(workspace or ".")
     if not is_git_repo(ws):
         return {"touched_files": [], "interface_contracts": [], "diff_partial": True, "git_verified": False}
 
-    raw_base = (base_commit or "").strip()
-    if not raw_base and task_id:
-        raw_base = str((load_tasks(ws).get(pkt_safe_id(task_id)) or {}).get("base_commit") or "").strip()
+    tasks = load_tasks(ws)
+    tid = pkt_safe_id(task_id) if task_id else ""
+    task_rec = (tasks.get(tid) or {}) if tid else {}
 
+    raw_base = (base_commit or "").strip() or str(task_rec.get("base_commit") or "").strip()
     valid_base = raw_base if git_commit_exists(ws, raw_base) else ""
-    diff_partial = not bool(valid_base)
+    has_baseline = "baseline_snap" in task_rec
+    baseline_snap: dict[str, str] = dict(task_rec.get("baseline_snap") or {})
+    owned_files: set[str] = {str(f).replace("\\", "/") for f in (task_rec.get("owned_files") or []) if f}
 
-    touched: set[str] = set(explicit_files or [])
-    if valid_base:
+    diff_partial = (not bool(valid_base)) or (bool(tid) and not has_baseline and explicit_files is None)
+
+    snap_now = snapshot_worktree(ws)
+    snap_now.pop("__HEAD__", None)
+
+    # Subtract pre-claim dirty/untracked files whose content hash has NOT changed since claim
+    post_claim_worktree: set[str] = {
+        f.replace("\\", "/") for f, h in snap_now.items() if baseline_snap.get(f) != h
+    }
+
+    # Files owned by OTHER tasks in `.mcp-agents/tasks.json`
+    other_task_owned: set[str] = set()
+    for other_id, other_rec in tasks.items():
+        if other_id != tid and isinstance(other_rec, dict):
+            for f in other_rec.get("owned_files") or []:
+                other_task_owned.add(_norm_path(f))
+
+    has_observed_scope = explicit_files is not None or bool(owned_files)
+    if has_observed_scope:
+        # `agent_run` path (or `pkt_save` after `agent_run`): use exact observed file set, never sweep worktree!
+        touched: set[str] = set(owned_files)
+        for f in explicit_files or []:
+            nf = str(f).replace("\\", "/").strip()
+            if nf and not _is_internal_meta(nf):
+                touched.add(nf)
+    elif valid_base:
+        # Standalone `pkt_save` path (no `agent_run` observed the execution):
+        committed_since_base: set[str] = set()
         try:
-            r_names = subprocess.run(["git", "diff", "--name-only", valid_base], cwd=ws, capture_output=True, text=True, timeout=8)
-            if r_names.returncode == 0:
-                touched.update(f.strip() for f in r_names.stdout.splitlines() if f.strip())
+            r_comm = subprocess.run(
+                ["git", "diff", "--name-only", valid_base, "HEAD"],
+                cwd=ws,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if r_comm.returncode == 0:
+                committed_since_base.update(f.strip().replace("\\", "/") for f in r_comm.stdout.splitlines() if f.strip())
             else:
                 diff_partial = True
         except Exception:
             diff_partial = True
+
+        unowned_wt = {f for f in post_claim_worktree if _norm_path(f) not in other_task_owned}
+        touched = committed_since_base | unowned_wt
+        # Uncommitted files in a shared worktree without `agent_run` snapshots cannot be proven exclusive!
+        if unowned_wt:
+            diff_partial = True
     else:
-        # Heuristic fallback: uncommitted changes or HEAD~1 (always flagged diff_partial=True)
-        snap = snapshot_worktree(ws)
-        snap.pop("__HEAD__", None)
-        if snap:
-            touched.update(snap.keys())
-        else:
+        # Unclaimed heuristic fallback (always `diff_partial=True`)
+        diff_partial = True
+        touched = set(post_claim_worktree)
+        if not touched:
             r_last = subprocess.run(["git", "diff", "--name-only", "HEAD~1", "HEAD"], cwd=ws, capture_output=True, text=True, timeout=5)
             if r_last.returncode == 0:
-                touched.update(f.strip() for f in r_last.stdout.splitlines() if f.strip())
-
-    # Include untracked new files if inside git status
-    snap_now = snapshot_worktree(ws)
-    snap_now.pop("__HEAD__", None)
-    if valid_base:
-        # Untracked files created after base_commit are in snap_now
-        try:
-            r_untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=ws, capture_output=True, text=True, timeout=5)
-            if r_untracked.returncode == 0:
-                touched.update(f.strip() for f in r_untracked.stdout.splitlines() if f.strip())
-        except Exception:
-            pass
+                touched.update(f.strip().replace("\\", "/") for f in r_last.stdout.splitlines() if f.strip())
 
     ordered_files = sorted(f.replace("\\", "/") for f in touched if f and not _is_internal_meta(f))
+
+    # Pre-claim dirty overlap or active foreign lock intersection -> must flag PARTIAL_DIFF / (?)
+    baseline_norms = {_norm_path(k) for k in baseline_snap}
+    if any(_norm_path(f) in baseline_norms for f in ordered_files):
+        diff_partial = True
+
+    foreign_locks = _active_foreign_locked_files(ws, exclude_owner=lock_owner)
+    if task_rec.get("lock_conflict") or any(_norm_path(f) in foreign_locks for f in ordered_files):
+        diff_partial = True
+
     code_files = [f for f in ordered_files if f.lower().endswith(_CODE_EXTS)][:12]
     contracts: list[str] = []
 
@@ -355,7 +450,6 @@ def extract_git_facts(workspace: str = ".", task_id: str = "", base_commit: str 
         tracked_code = []
         for cf in code_files:
             full_cf = os.path.join(ws, cf)
-            # Check if file is untracked; if untracked, synthesize `+` lines so new file contracts are captured!
             r_ls = subprocess.run(["git", "ls-files", "--error-unmatch", "--", cf], cwd=ws, capture_output=True, timeout=3)
             if r_ls.returncode != 0 and os.path.isfile(full_cf):
                 try:
@@ -633,10 +727,16 @@ def build_pkt_from_git(
     qa_status: str = "",
     delegated: bool = False,
     explicit_files: list[str] | None = None,
+    lock_owner: str = "",
     store_path: str | None = None,
 ) -> str:
     """Builds a truthful @PKT extracting `touched_files` & `interface_contracts` from Git; LLM supplies only `why`/`nxt`."""
-    facts = extract_git_facts(workspace=workspace, task_id=task_id, explicit_files=explicit_files)
+    facts = extract_git_facts(
+        workspace=workspace,
+        task_id=task_id,
+        explicit_files=explicit_files,
+        lock_owner=lock_owner,
+    )
     data = {
         "id": task_id,
         "status": status,

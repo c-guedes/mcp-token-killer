@@ -20,6 +20,7 @@ from pkt_core import (
     is_git_repo,
     pkt_safe_id,
     record_deltas,
+    record_task_owned_files,
     release_locks,
     resolve_pkt_ref,
     smart_truncate,
@@ -485,11 +486,13 @@ def run_cli(
     lock_owner = f"{actor}:{uuid.uuid4().hex[:8]}"
     locked_files: list[str] = []
     warnings: list[str] = []
+    had_lock_conflict = False
     if work and pkt_ref:
         locked_files = _extract_pkt_files(pkt_ref, ws)
         if locked_files:
             ok_lock, conflicts = acquire_locks(lock_owner, locked_files, workspace=ws, cli=actor)
             if not ok_lock:
+                had_lock_conflict = True
                 warnings.append("[CONCURRENT_EDIT] " + "; ".join(f"{c.get('file')} active by {c.get('cli')}" for c in conflicts))
                 locked_files = []
 
@@ -594,12 +597,14 @@ def run_cli(
                 if changed:
                     res["changed_files"] = changed
                 if work:
+                    record_task_owned_files(eff_task_id, changed, workspace=ws, lock_conflict=had_lock_conflict)
                     res["pkt"] = build_pkt_from_git(
                         task_id=eff_task_id,
                         workspace=ws,
                         cli=cand,
                         delegated=(cand != cli),
                         explicit_files=changed,
+                        lock_owner=lock_owner,
                     )
                 return res
 

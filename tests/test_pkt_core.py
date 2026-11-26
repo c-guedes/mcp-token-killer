@@ -135,19 +135,26 @@ class TestGitFactExtraction(unittest.TestCase):
         # Worker 1 commits partial work, then fails over to Worker 2
         with open(os.path.join(self.tmp, "Combat.cs"), "w", encoding="utf-8") as fh:
             fh.write("public class Combat {\n    public int Hp { get; set; }\n}\n")
-        _git(self.tmp, "add", ".")
+        _git(self.tmp, "add", "Combat.cs")
         _git(self.tmp, "commit", "-m", "c3: partial work by codex")
+        pkt.record_task_owned_files("KB-19", ["Combat.cs"], workspace=self.tmp)
 
         # Failover claim MUST preserve base1 (T18)
         base2 = pkt.ensure_base_commit("KB-19", workspace=self.tmp)
         self.assertEqual(base2, base1)
 
-        # Worker 2 adds GDScript & Python files (uncommitted)
+        # Unrelated process drops an untracked file in the shared worktree
+        with open(os.path.join(self.tmp, "outro.gd"), "w", encoding="utf-8") as fh:
+            fh.write("func intruder():\n    pass\n")
+
+        # Worker 2 adds Player.gd (uncommitted, observed via owned_files)
         with open(os.path.join(self.tmp, "Player.gd"), "w", encoding="utf-8") as fh:
             fh.write("@export var speed: int = 5\nfunc _ready():\n    pass\nfunc apply_stun(d: int):\n    pass\n")
+        pkt.record_task_owned_files("KB-19", ["Player.gd"], workspace=self.tmp)
 
         line = pkt.build_pkt_from_git("KB-19", workspace=self.tmp, cli="claude", handoff_why="stun", handoff_next="wire hud")
         self.assertNotIn("OtherCard.cs", line)
+        self.assertNotIn("outro.gd", line)
         self.assertNotIn(".mcp-agents", line)
         self.assertIn("f=Combat.cs,Player.gd", line)
         self.assertIn("@export var speed", line)
@@ -161,6 +168,48 @@ class TestGitFactExtraction(unittest.TestCase):
         ref = line.split("|ref=")[1]
         resolved = pkt.resolve_pkt_ref(ref, workspace=self.tmp)
         self.assertTrue(any("public int Hp { get; set; }" in c for c in resolved["contracts"]))
+
+    def test_t19b_preclaim_dirty_subtracted_and_foreign_uncommitted_never_exact(self):
+        # 1) Pre-existing untracked file BEFORE claim must be subtracted completely
+        with open(os.path.join(self.tmp, "pre_existing.gd"), "w", encoding="utf-8") as fh:
+            fh.write("func old_noise():\n    pass\n")
+
+        pkt.ensure_base_commit("KB-20", workspace=self.tmp)
+        with open(os.path.join(self.tmp, "clean_work.gd"), "w", encoding="utf-8") as fh:
+            fh.write("func clean_api():\n    pass\n")
+        _git(self.tmp, "add", "clean_work.gd")
+        _git(self.tmp, "commit", "-m", "kb-20 commit")
+
+        p_clean = pkt.build_pkt_from_git("KB-20", workspace=self.tmp, cli="codex")
+        self.assertNotIn("pre_existing.gd", p_clean)
+        self.assertIn("f=clean_work.gd", p_clean)
+        self.assertNotIn("PARTIAL_DIFF", p_clean)
+        self.assertNotIn("(?)", p_clean)
+
+        # 2) Claim, then another external process creates `outro.gd` WITHOUT committing -> never appears without `(?)`
+        pkt.ensure_base_commit("KB-21", workspace=self.tmp)
+        with open(os.path.join(self.tmp, "outro.gd"), "w", encoding="utf-8") as fh:
+            fh.write("func foreign_uncommitted():\n    pass\n")
+
+        p_uncomm = pkt.build_pkt_from_git("KB-21", workspace=self.tmp, cli="codex")
+        if "outro.gd" in p_uncomm:
+            self.assertIn("PARTIAL_DIFF", p_uncomm)
+            self.assertIn("(?)", p_uncomm)
+
+        # If `outro.gd` belongs to another MCP task's owned_files, it is subtracted completely
+        pkt.record_task_owned_files("KB-OTHER", ["outro.gd"], workspace=self.tmp)
+        p_subtracted = pkt.build_pkt_from_git("KB-21", workspace=self.tmp, cli="codex")
+        self.assertNotIn("outro.gd", p_subtracted)
+
+        # 3) Active foreign lock intersection forces PARTIAL_DIFF / (?)
+        pkt.record_task_owned_files("KB-20", ["clean_work.gd"], workspace=self.tmp)
+        pkt.acquire_locks("grok:other999", ["clean_work.gd"], workspace=self.tmp, cli="grok")
+        try:
+            p_locked = pkt.build_pkt_from_git("KB-20", workspace=self.tmp, cli="codex", lock_owner="codex:me111")
+            self.assertIn("PARTIAL_DIFF", p_locked)
+            self.assertIn("(?)", p_locked)
+        finally:
+            pkt.release_locks("grok:other999", workspace=self.tmp)
 
     def test_partial_diff_flagged_without_valid_base_commit(self):
         with open(os.path.join(self.tmp, "mod.py"), "w", encoding="utf-8") as fh:
