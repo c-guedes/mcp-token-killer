@@ -44,6 +44,50 @@ _LIMIT_PATTERNS = (
 )
 
 _COOLDOWNS: dict[str, float] = {}
+
+# Signals that a CLI is unusable because of its login, not because the task failed.
+_AUTH_PATTERNS = (
+    "failed to authenticate", "not logged in", "not authenticated", "please log in", "please login",
+    "login required", "unauthorized", "invalid api key", "invalid_api_key", "api key not",
+    "session expired", "token expired", "oauth", "authentication failed", "authentication_error",
+)
+LOGIN_PROBE_PROMPT = "Responda apenas a palavra: ok"
+LOGIN_TTL_S = 900
+LOGIN_PROBE_TIMEOUT = 60
+# cli -> {"login": ok|auth_error|rate_limited|timeout|error, "ts": epoch, "detail": str}
+_LOGIN_STATE: dict[str, dict] = {}
+
+
+def allowed_clis() -> tuple[str, ...]:
+    """CLIs this gateway may run, in fallback order.
+
+    `MCP_AGENTS_ALLOWED=claude,codex` restricts both direct calls and fallback (e.g. only the
+    vendors approved in a corporate environment). Unknown names are ignored. Unset = all supported.
+    """
+    raw = os.environ.get("MCP_AGENTS_ALLOWED", "").strip()
+    if not raw:
+        return DEFAULT_CHAIN
+    wanted = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    return tuple(c for c in wanted if c in DEFAULT_CHAIN)
+
+
+def is_installed(cli: str) -> bool:
+    return bool(resolve_exe([_env_bin(cli)]))
+
+
+def _login_state(cli: str) -> dict | None:
+    st = _LOGIN_STATE.get(cli)
+    if st and time.time() - float(st.get("ts") or 0) <= LOGIN_TTL_S:
+        return st
+    return None
+
+
+def _is_auth_error(out: str, err: str, rc: int) -> bool:
+    text = (out or "") + "\n" + (err or "")
+    if rc == 0 and '"is_error": true' not in text and '"is_error":true' not in text:
+        return False
+    low = text.lower()
+    return any(p in low for p in _AUTH_PATTERNS)
 _RECENT_CALLS: dict[tuple[str, str], int] = {}
 
 
@@ -162,19 +206,79 @@ def build_cmd(
     raise ValueError(f"Unsupported CLI: {cli}. Supported: {', '.join(DEFAULT_CHAIN)}")
 
 
-def list_clis() -> dict[str, dict]:
-    """Returns availability and cooldown status for each supported CLI."""
+def probe_login(cli: str, timeout: int = LOGIN_PROBE_TIMEOUT) -> dict:
+    """Runs a minimal headless prompt to check that `cli` is logged in and answering.
+
+    Runs in an empty temporary directory, in read mode, with recursion disabled, so the probe
+    neither reads the project nor calls other agents. Costs one tiny request per CLI.
+    """
+    import tempfile
+
+    if cli not in allowed_clis():
+        return {"login": "not_allowed"}
+    raw_cmd = build_cmd(cli, LOGIN_PROBE_PROMPT, workspace=".", mode="read")
+    cmd = resolve_exe(raw_cmd)
+    if not cmd:
+        return {"login": "not_installed"}
+    env = dict(os.environ)
+    env["MCP_AGENTS_DEPTH"] = str(MAX_DEPTH + 10)  # nested agent_run calls refuse immediately
+    env["PYTHONIOENCODING"] = "utf-8"
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(prefix="mcp_login_") as tmp:
+        try:
+            proc = subprocess.run(
+                cmd, cwd=tmp, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", env=env, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            res = {"login": "timeout", "detail": f"no answer in {timeout}s"}
+        except Exception as exc:
+            res = {"login": "error", "detail": smart_truncate(str(exc), 200)}
+        else:
+            text, _sid, _usage = _extract_json_response(proc.stdout)
+            blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
+            if _is_auth_error(proc.stdout, proc.stderr, proc.returncode):
+                res = {"login": "auth_error", "detail": smart_truncate(blob.strip(), 200)}
+            elif _is_limit_error(proc.stdout, proc.stderr, proc.returncode):
+                res = {"login": "rate_limited", "detail": smart_truncate(blob.strip(), 200)}
+            elif proc.returncode == 0 and (text or "").strip():
+                res = {"login": "ok", "answer": smart_truncate(text.strip(), 40)}
+            else:
+                res = {"login": "error", "detail": smart_truncate(blob.strip() or f"rc={proc.returncode}", 200)}
+    res["secs"] = round(time.time() - t0, 1)
+    _LOGIN_STATE[cli] = {"login": res["login"], "ts": time.time(), "detail": res.get("detail", "")}
+    return res
+
+
+def list_clis(check_login: bool = False) -> dict[str, dict]:
+    """Allowed CLIs with install status, cooldown and (optionally probed) login state.
+
+    `check_login=True` runs `probe_login` on every installed allowed CLI, in parallel.
+    """
     now = time.time()
-    out = {}
-    for cli in DEFAULT_CHAIN:
-        bin_name = _env_bin(cli)
-        resolved = resolve_exe([bin_name])
+    allowed = allowed_clis()
+    out: dict[str, dict] = {}
+    for cli in allowed:
+        resolved = resolve_exe([_env_bin(cli)])
         cd_until = _COOLDOWNS.get(cli, 0.0)
         out[cli] = {
             "available": bool(resolved),
             "path": resolved[0] if resolved else None,
             "cooldown_s": max(0, int(cd_until - now)),
         }
+        st = _login_state(cli)
+        if st:
+            out[cli]["login"] = st["login"]
+    if check_login:
+        from concurrent.futures import ThreadPoolExecutor
+
+        targets = [c for c in allowed if out[c]["available"]]
+        with ThreadPoolExecutor(max_workers=max(1, min(4, len(targets)))) as pool:
+            for c, res in zip(targets, pool.map(probe_login, targets)):
+                out[c].update(res)
+    excluded = [c for c in DEFAULT_CHAIN if c not in allowed]
+    if excluded:
+        out["_not_allowed"] = excluded  # type: ignore[assignment]
     return out
 
 
@@ -506,6 +610,12 @@ def run_cli(
     if role_cfg.get("model") and not model:
         model = str(role_cfg["model"])
 
+    if cli not in allowed_clis():
+        return {"ok": False, "cli": cli, "rc": 2,
+                "error": f"'{cli}' is not allowed here (MCP_AGENTS_ALLOWED={','.join(allowed_clis()) or '-'})."}
+    if not is_installed(cli):
+        return {"ok": False, "cli": cli, "rc": 2, "error": f"'{_env_bin(cli)}' is not installed (not found in PATH)."}
+
     max_depth = int(os.environ.get("MCP_AGENTS_MAX_DEPTH", str(MAX_DEPTH)) or MAX_DEPTH)
     depth = int(os.environ.get("MCP_AGENTS_DEPTH", "0") or "0")
     if depth >= max_depth:
@@ -566,9 +676,17 @@ def run_cli(
     now = time.time()
     chain = [cli]
     if fallback and not eff_sid:
-        for c in DEFAULT_CHAIN:
+        # Fallback only to CLIs that are allowed, installed, not cooling down and not known to be logged out.
+        for c in allowed_clis():
             cand_actor = f"{c}:{role}" if role else c
-            if c != cli and cand_actor not in chain_env and _COOLDOWNS.get(c, 0.0) <= now:
+            st = _login_state(c)
+            if (
+                c != cli
+                and cand_actor not in chain_env
+                and _COOLDOWNS.get(c, 0.0) <= now
+                and not (st and st["login"] == "auth_error")
+                and is_installed(c)
+            ):
                 chain.append(c)
 
     env = dict(os.environ)
@@ -593,7 +711,9 @@ def run_cli(
             cmd = resolve_exe(raw_cmd)
             if not cmd:
                 last_err = f"'{_env_bin(cand)}' not found in PATH"
-                break
+                if cand == cli:
+                    break
+                continue  # a fallback candidate vanished from PATH: skip it, keep the chain
 
             snap_before = snapshot_worktree(ws) if work else {}
             t0 = time.time()
@@ -627,6 +747,16 @@ def run_cli(
                     continue
                 break
 
+            if _is_auth_error(proc.stdout, proc.stderr, proc.returncode):
+                # The CLI is unusable (login missing/expired), not the task: same nature as a rate limit.
+                _LOGIN_STATE[cand] = {"login": "auth_error", "ts": time.time(),
+                                      "detail": smart_truncate(proc.stderr or proc.stdout or "", 200)}
+                _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, 0)
+                last_err = f"{cand}: login missing or expired. " + smart_truncate(proc.stderr or proc.stdout or "", 300)
+                if fallback and not eff_sid:
+                    continue
+                break
+
             text, out_sid, usage_meta = _extract_json_response(proc.stdout)
             snap_after = snapshot_worktree(ws) if work else {}
             changed = diff_worktree_snapshots(ws, snap_before, snap_after) if work else []
@@ -634,6 +764,7 @@ def run_cli(
                 record_deltas(cand_actor, _git_diff_hunks(ws, changed), workspace=ws)
 
             if proc.returncode == 0 and (text or changed):
+                _LOGIN_STATE[cand] = {"login": "ok", "ts": time.time(), "detail": ""}
                 _log_metric(ws, cand, eff_mode, True, dur, len(full_prompt), pkt_len, len(text), usage=usage_meta)
                 final_sid = out_sid or (eff_sid if cand == cli else "")
                 if role and final_sid:

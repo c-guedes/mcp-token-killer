@@ -42,10 +42,15 @@ def agent_run(
     role: str = "",
     task_id: str = "",
     fallback: bool = True,
+    check_login: bool = False,
 ) -> str:
-    """Run/resume a CLI agent (grok|codex|claude|gemini|opencode|agy) with optional role & @PKT, or cli='status'."""
+    """Run/resume a CLI agent (grok|codex|claude|gemini|opencode|agy) with optional role & @PKT.
+
+    `cli='status'` lists the allowed CLIs that are installed; add `check_login=True` to send each one
+    a tiny probe prompt and report `login: ok|auth_error|rate_limited|timeout|error`.
+    """
     if cli == "status":
-        return json.dumps(list_clis(), ensure_ascii=False)
+        return json.dumps(list_clis(check_login=check_login), ensure_ascii=False)
     if not prompt.strip():
         return json.dumps({"ok": False, "error": "prompt is required"}, ensure_ascii=False)
     res = run_cli(

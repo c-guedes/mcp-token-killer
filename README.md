@@ -34,7 +34,9 @@ Em fluxos multi-agente, handoffs em prosa (*"editei a classe X, tive um erro na 
 ## Tools expostas (4)
 
 - `agent_run(cli, prompt, workspace=".", pkt_ref="", session_id="", mode="read", model="", role="", task_id="", fallback=True)`
-  - Orquestra `grok`, `codex`, `claude`, `gemini`, `opencode` ou `agy` (ou `cli="status"` para listar disponibilidade/cooldowns).
+  - Orquestra `grok`, `codex`, `claude`, `gemini`, `opencode` ou `agy`, **somente as permitidas e instaladas**. Pedir uma CLI fora da lista ou ausente do `PATH` retorna erro sem executar nada.
+  - `cli="status"` lista as CLIs permitidas, se estão instaladas e o cooldown. Com `check_login=True`, manda a cada CLI instalada um prompt mínimo (numa pasta temporária vazia, modo leitura, sem permitir chamadas aninhadas) e reporta `login: ok | auth_error | rate_limited | timeout | error`. Custa uma requisição pequena por CLI.
+  - Fallback só acontece por **limite de uso ou login expirado** (a CLI ficou inutilizável, não a tarefa), e só para CLIs permitidas, instaladas e sem falha de login conhecida nos últimos 15 minutos.
   - Em `mode="work"`, fixa `base_commit` no primeiro claim, detecta arquivos alterados por hash de conteúdo (incluindo arquivos já sujos editados novamente) e devolve `"pkt"` gerado direto do Git.
 - `pkt_save(id, handoff_why="", handoff_next="", workspace=".", op="HND", status="doing", cli="-", qa_status="", base_commit="", claim=False)`
   - Gera um `@PKT` combinando `f=` e `api=` extraídos do Git com o `why` e `nxt` informados. Passe `claim=True` antes de iniciar edições manuais para fixar o `base_commit`, ou `base_commit="origin/main"` para extrair o pacote de uma branch/PR externo (ex.: Devin, CI).
@@ -104,6 +106,7 @@ O `install.py` registra o servidor globalmente nas CLIs instaladas (`grok`, `cod
 | Variável | Efeito |
 |---|---|
 | `MCP_PKT_REFS` | Caminho customizado para `pkt_refs.json` |
+| `MCP_AGENTS_ALLOWED` | CLIs que o gateway pode usar, na ordem de fallback (ex.: `claude,codex`). Vale para chamada direta e fallback. Sem ela, todas as suportadas |
 | `MCP_CLI_<NOME>` | Binário customizado para uma CLI (ex.: `MCP_CLI_GEMINI`) |
 | `MCP_AGENTS_MAX_DEPTH` | Profundidade máxima de delegação entre agentes (padrão: `2`) |
 | `MCP_ALLOW_WORKSPACE_ROLES=1` | Permite carregar `.mcp-agents/roles.json` e `.claude/agents/*.md` do workspace |
