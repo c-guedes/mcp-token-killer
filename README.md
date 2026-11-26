@@ -21,7 +21,8 @@ Em fluxos multi-agente, handoffs em prosa (*"editei a classe X, tive um erro na 
 ```
 
 - **`f=` (`touched_files`):** extraído de `git diff --name-only <base_commit>` + arquivos novos/modificados no worktree (nunca preenchido pelo LLM).
-- **`api=` (`interface_contracts`):** assinaturas públicas extraídas das linhas `+` de `git diff -U0` via `CONTRACT_SIG_RE` (GDScript, Python, C#, TypeScript/JS, Rust), ignorando identificadores privados com `_`.
+- **`api=` (`interface_contracts`):** declarações públicas cuja assinatura toca uma linha adicionada no diff, extraídas com parser real (tree-sitter, ver [Linguagens suportadas](#linguagens-suportadas)). Assinaturas em várias linhas, métodos de classe e receivers do Go são capturados; mudança só no corpo de uma função não vira contrato.
+- **`base_commit` externo (PR de outro agente, ex.: Devin):** `pkt_save(id, base_commit="origin/main")` usa o `merge-base` entre a branch e o alvo, então commits que chegaram ao `main` depois da bifurcação não entram no pacote.
 - **`base_commit` no claim (herdado em failover):** gravado em `.mcp-agents/tasks.json` no início do trabalho em `mode="work"` (ou `pkt_save(..., claim=True)`) e preservado se outro agente assumir depois.
 - **Escopo cumulativo da tarefa (`task_id`):** o `@PKT` descreve o estado acumulado da **tarefa desde o `claim`** (`base_commit`), e não apenas o delta do último agente. O campo `cli=` identifica quem emitiu o último pacote; para saber o que cada agente alterou isoladamente na última rodada, o gateway injeta linhas `[DELTA] <cli> edited <arquivo>: @@ ... @@`.
 - **`PARTIAL_DIFF` e `(?)`:** se não houver `base_commit` validado (ex.: rebase/squash ou execução sem claim prévio), se houver arquivo não commitado fora da janela do `agent_run` ou conflito de lock ativo, o pacote acende `[PARTIAL_DIFF]` e anexa `,(?)` em `api=` para sinalizar que o diff é aproximado.
@@ -53,9 +54,30 @@ Em fluxos multi-agente, handoffs em prosa (*"editei a classe X, tive um erro na 
 
 ---
 
+## Linguagens suportadas
+
+A extração de contratos e o `[REPOMAP]` usam tree-sitter. Cada linguagem tem sua regra de visibilidade pública:
+
+| Linguagem | Extensões | Público quando |
+|---|---|---|
+| Python, GDScript, Ruby | `.py` `.gd` `.rb` | nome não começa com `_` (GDScript: `var` só com `@export`) |
+| TypeScript / JavaScript | `.ts` `.tsx` `.js` `.jsx` `.mjs` `.cjs` | declaração exportada; métodos de classe exportada sem `private`/`protected`/`#` |
+| Go | `.go` | nome começa com maiúscula (inclui métodos com receiver) |
+| Java, C# | `.java` `.cs` | modificador `public`, ou membro de `interface` |
+| Kotlin, Swift | `.kt` `.kts` `.swift` | sem `private`/`internal`/`protected` (Swift: sem `private`/`fileprivate`) |
+| Rust | `.rs` | `pub` (membros de `trait` herdam) |
+| PHP | `.php` | sem `private`/`protected` |
+| C / C++ | `.c` `.h` `.cpp` `.cc` `.hpp` | não `static`, nome sem `_` |
+
+Membros (funções, métodos, propriedades) vêm antes das declarações de tipo no `api=`, já que o tipo aparece como qualificador: `svc.ts(Svc): \`cancel(id: string): boolean\``.
+
+**Fallback sinalizado:** se a gramática de um arquivo não estiver disponível, a extração cai para a regex antiga só naquele arquivo e o `api=` recebe `(?)`. A lista de arquivos (`f=`) continua exata, então `PARTIAL_DIFF` não acende por isso.
+
+**Gramáticas e rede:** o `tree-sitter-language-pack` baixa cada gramática no primeiro uso e guarda em cache local. Em máquina sem acesso à internet (ou com proxy corporativo), rode antes, numa máquina com rede, `python install.py --grammars` para pré-baixar as gramáticas das linguagens acima. Sem a gramática, o comportamento é o fallback sinalizado, nunca omissão silenciosa.
+
 ## Instalação
 
-Requisitos: Python 3.10+ e `mcp` 2.x.
+Requisitos: Python 3.10+, `mcp` 2.x e `tree-sitter-language-pack` (para extração multilinguagem).
 
 ```bash
 pip install -r requirements.txt

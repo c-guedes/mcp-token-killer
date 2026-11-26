@@ -13,6 +13,16 @@ import subprocess
 import threading
 import time
 
+from lang_contracts import (
+    CODE_EXTS as _TS_CODE_EXTS,
+    extract_declarations,
+    extract_public_contracts,
+    format_contract,
+    rank_contracts,
+    lang_for_path,
+    parse_added_lines,
+)
+
 # 16-bit status flags (bitmask)
 BIT_CODE_TOUCHED = 1 << 0
 BIT_API_CHANGED = 1 << 1
@@ -38,9 +48,11 @@ _BIT_LABELS = (
 
 MICRO_OPS = ("ACK", "LCK", "PUB", "DEP", "BLK", "HND", "QAP", "QAF")
 
-_CODE_EXTS = (".gd", ".cs", ".py", ".ts", ".tsx", ".js", ".rs", ".go")
+# Every extension with a tree-sitter grammar mapping; the regex below is only a flagged fallback.
+_CODE_EXTS = tuple(dict.fromkeys(_TS_CODE_EXTS + (".gd", ".cs", ".py", ".ts", ".tsx", ".js", ".rs", ".go")))
 
-# Public contract signatures on `+` lines of `git diff -U0`.
+# Legacy fallback: public contract signatures on `+` lines of `git diff -U0`,
+# used only when no tree-sitter parser is available (result is flagged `(?)`).
 # Private identifiers starting with `_` (`_ready`, `__init__`, `_helper`) are excluded.
 CONTRACT_SIG_RE = re.compile(
     r"^\+\s*(?:static\s+|async\s+)*(?:"
@@ -365,6 +377,64 @@ def extract_contracts_from_diff(diff_text: str, workspace: str = ".") -> list[st
     return contracts
 
 
+def _split_diff_by_file(diff_text: str) -> dict[str, str]:
+    """Splits a (possibly synthesized) unified diff into per-file chunks keyed by `b/` path."""
+    out: dict[str, list[str]] = {}
+    cur = ""
+    for line in (diff_text or "").splitlines():
+        if line.startswith("+++ "):
+            p = line[4:].strip()
+            cur = p[2:] if p.startswith("b/") else p
+            out.setdefault(cur, [])
+        if cur:
+            out[cur].append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def _contracts_for_files(ws: str, code_files: list[str], added_by_file: dict, diff_text: str) -> tuple[list[str], bool]:
+    """Public contracts per changed file via tree-sitter; regex fallback is flagged as partial.
+
+    Returns (contracts, partial). `partial` is True when any file had to use the regex
+    fallback (no grammar/parser), so the packet shows `(?)` instead of silently missing
+    multi-line signatures, class methods or Go receivers.
+    """
+    found: list[tuple[str, dict, str]] = []
+    fallback: list[str] = []
+    partial = False
+    chunks = None
+    for cf in code_files:
+        full = os.path.join(ws, cf)
+        if not os.path.isfile(full) or cf not in added_by_file:
+            continue
+        lang = lang_for_path(cf)
+        decls = None
+        if lang:
+            try:
+                with open(full, "rb") as fh:
+                    src = fh.read()
+                decls = extract_public_contracts(src, lang, added_by_file[cf])
+            except OSError:
+                decls = None
+        if decls is not None:
+            found.extend((cf, d, lang) for d in decls)
+            continue
+        partial = True
+        if chunks is None:
+            chunks = _split_diff_by_file(diff_text)
+        fallback.extend(extract_contracts_from_diff(chunks.get(cf, ""), workspace=ws))
+    ranked = rank_contracts([(cf, d) for cf, d, _ in found])
+    lang_of = {id(d): lang for _, d, lang in found}
+    contracts: list[str] = []
+    for cf, d in ranked:
+        entry = format_contract(cf, d, lang_of[id(d)])
+        if entry not in contracts:
+            contracts.append(entry)
+    for entry in fallback:
+        if entry not in contracts:
+            contracts.append(entry)
+    return contracts, partial
+
+
 def _active_foreign_locked_files(workspace: str, exclude_owner: str = "") -> set[str]:
     locks = _load_locks(_locks_path(workspace))
     out: set[str] = set()
@@ -402,11 +472,24 @@ def extract_git_facts(
 
     raw_base = (base_commit or "").strip() or str(task_rec.get("base_commit") or "").strip()
     valid_base = raw_base if git_commit_exists(ws, raw_base) else ""
+    if valid_base:
+        # An external ref (`origin/main`, a PR target) may have moved on after the branch was cut.
+        # Diffing against its tip would pull the target's newer commits into this task, marked as exact.
+        # `merge-base` returns the fork point; for a base recorded at claim (an ancestor of HEAD) it is a no-op.
+        try:
+            r_mb = subprocess.run(["git", "merge-base", valid_base, "HEAD"], cwd=ws, capture_output=True, text=True, timeout=5)
+            mb = (r_mb.stdout or "").strip()
+            valid_base = mb if r_mb.returncode == 0 and mb else ""
+        except Exception:
+            valid_base = ""
     has_baseline = "baseline_snap" in task_rec
     baseline_snap: dict[str, str] = dict(task_rec.get("baseline_snap") or {})
     owned_files: set[str] = {str(f).replace("\\", "/") for f in (task_rec.get("owned_files") or []) if f}
 
-    diff_partial = (not bool(valid_base)) or (bool(tid) and not has_baseline and explicit_files is None)
+    external_base = bool((base_commit or "").strip())
+    # Without a claim, a task's scope is unknown -> partial. An explicit external base (PR branch) is the
+    # exception: committed changes since the fork point are exact; stray worktree files still flag below.
+    diff_partial = (not bool(valid_base)) or (bool(tid) and not has_baseline and explicit_files is None and not external_base)
 
     snap_now = snapshot_worktree(ws)
     snap_now.pop("__HEAD__", None)
@@ -476,6 +559,7 @@ def extract_git_facts(
 
     code_files = [f for f in ordered_files if f.lower().endswith(_CODE_EXTS)][:12]
     contracts: list[str] = []
+    contracts_partial = False
 
     if code_files:
         diff_chunks: list[str] = []
@@ -493,6 +577,11 @@ def extract_git_facts(
             else:
                 tracked_code.append(cf)
 
+        added_by_file: dict[str, set[int] | None] = {}
+        for chunk in diff_chunks:  # untracked files: every line is new
+            m_f = re.match(r"\+\+\+ b/(.+)", chunk)
+            if m_f:
+                added_by_file[m_f.group(1).strip()] = None
         if tracked_code:
             diff_cmd = ["git", "diff", "-U0", valid_base, "--"] + tracked_code if valid_base else ["git", "diff", "-U0", "HEAD~1", "--"] + tracked_code
             r_diff = subprocess.run(diff_cmd, cwd=ws, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
@@ -501,13 +590,16 @@ def extract_git_facts(
                 diff_partial = True
             if r_diff.stdout:
                 diff_chunks.append(r_diff.stdout)
+                for f_path, lines in parse_added_lines(r_diff.stdout).items():
+                    added_by_file[f_path] = lines
 
-        contracts = extract_contracts_from_diff("\n".join(diff_chunks), workspace=ws)
+        contracts, contracts_partial = _contracts_for_files(ws, code_files, added_by_file, "\n".join(diff_chunks))
 
     return {
         "touched_files": ordered_files,
         "interface_contracts": contracts,
         "diff_partial": diff_partial,
+        "contracts_partial": contracts_partial,
         "git_verified": True,
     }
 
@@ -524,6 +616,23 @@ def file_skeleton(rel_path: str, workspace: str = ".", max_syms: int = 8) -> str
         if ck in _SKELETON_CACHE:
             return _SKELETON_CACHE[ck]
         syms: list[str] = []
+        lang = lang_for_path(rel_path)
+        decls = None
+        if lang:
+            with open(full, "rb") as fbin:
+                decls = extract_declarations(fbin.read(), lang)
+        if decls is not None:
+            for d in decls:
+                if not d["public"] and d["name"].startswith(("_", "#")):
+                    continue
+                syms.append(f"L{d['line']}:{d['signature'][:55]}")
+                if len(syms) >= max_syms:
+                    break
+            res = f"{rel_path} [{', '.join(syms)}]" if syms else ""
+            if len(_SKELETON_CACHE) > 512:
+                _SKELETON_CACHE.clear()
+            _SKELETON_CACHE[ck] = res
+            return res
         with open(full, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, line in enumerate(fh, 1):
                 if _SYM_DEF_RE.match(line):
@@ -725,7 +834,7 @@ def encode_packet(
     tf = ",".join(raw_tf[:4]) + f",(+{len(raw_tf) - 4})" if len(raw_tf) > 4 else (",".join(raw_tf) or "-")
     raw_ic = [re.sub(r"[\r\n|]+", " ", c) for c in hand["interface_contracts"]]
     linearized_ic = [re.sub(r";\s*", ", ", c_item.rstrip(";").strip()) for c_item in raw_ic]
-    lossy_mark = ",(?)" if data.get("diff_partial") else ""
+    lossy_mark = ",(?)" if (data.get("diff_partial") or data.get("contracts_partial")) else ""
     if len(linearized_ic) > 3:
         ic = ";".join(linearized_ic[:3]) + f";(+{len(linearized_ic) - 3})" + lossy_mark
     else:
@@ -778,6 +887,7 @@ def build_pkt_from_git(
         "touched_files": facts["touched_files"],
         "interface_contracts": facts["interface_contracts"],
         "diff_partial": facts["diff_partial"],
+        "contracts_partial": facts.get("contracts_partial", False),
         "git_verified": facts["git_verified"],
         "handoff_why": handoff_why,
         "handoff_next": handoff_next,

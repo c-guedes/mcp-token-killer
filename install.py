@@ -43,7 +43,20 @@ def register_opencode_json() -> tuple[bool, str]:
     return True, str(p)
 
 
+def prefetch_grammars() -> None:
+    """Downloads every grammar used by `lang_contracts` into the local tree-sitter cache."""
+    from lang_contracts import EXT_LANG  # noqa: E402
+    from tree_sitter_language_pack import download
+
+    langs = sorted(set(EXT_LANG.values()))
+    download(langs)
+    print(f"grammars  -> OK ({', '.join(langs)})")
+
+
 def main() -> None:
+    if "--grammars" in sys.argv[1:]:
+        prefetch_grammars()
+        return
     results = {
         "grok": _run(["grok", "mcp", "add", "mcp-agents", "--", PY, SERVER]),
         "codex": _run(["codex", "mcp", "add", "mcp-agents", "--", PY, SERVER]),
