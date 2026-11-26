@@ -185,24 +185,47 @@ def _is_limit_error(out: str, err: str, rc: int) -> bool:
     return any(p in low for p in _LIMIT_PATTERNS)
 
 
-def _extract_json_response(raw: str) -> tuple[str, str]:
-    """Extracts (text, session_id) when a CLI outputs JSON or NDJSON."""
+def _extract_usage(obj: dict) -> dict:
+    """Extracts normalized token/cost telemetry from Claude, Grok, or OpenCode JSON."""
+    u = obj.get("usage")
+    out: dict = {}
+    if isinstance(u, dict):
+        inp = int(u.get("input_tokens") or u.get("input") or 0)
+        c_read = int(u.get("cache_read_input_tokens") or (u.get("cache") or {}).get("read") or 0)
+        c_create = int(u.get("cache_creation_input_tokens") or (u.get("cache") or {}).get("write") or 0)
+        out_tok = int(u.get("output_tokens") or u.get("output") or 0)
+        # Note: Grok `input_tokens` does not include `cache_read_input_tokens`, Claude separates all 3
+        out["input_tokens"] = inp + c_read + c_create
+        out["cached_tokens"] = c_read
+        out["output_tokens"] = out_tok
+    if obj.get("num_turns") is not None:
+        out["turns"] = int(obj["num_turns"])
+    cost = obj.get("total_cost_usd")
+    if cost is not None:
+        out["cost_usd"] = round(float(cost), 6)
+    return out
+
+
+def _extract_json_response(raw: str) -> tuple[str, str, dict]:
+    """Extracts `(text, session_id, usage_meta)` when a CLI outputs JSON or NDJSON."""
     s = (raw or "").strip()
     if not s:
-        return "", ""
+        return "", "", {}
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
+            meta = _extract_usage(obj)
             if obj.get("is_error"):
-                return "", str(obj.get("session_id") or obj.get("sessionId") or "")
+                return "", str(obj.get("session_id") or obj.get("sessionId") or ""), meta
             txt = obj.get("result") or obj.get("response") or obj.get("text") or obj.get("content") or ""
             sid = obj.get("session_id") or obj.get("sessionId") or obj.get("sessionID") or ""
             if isinstance(txt, str) and txt:
-                return txt, str(sid)
+                return txt, str(sid), meta
     except Exception:
         pass
     sid = ""
     parts = []
+    meta: dict = {}
     for line in s.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -213,16 +236,26 @@ def _extract_json_response(raw: str) -> tuple[str, str]:
             continue
         if isinstance(obj, dict):
             sid = str(obj.get("session_id") or obj.get("sessionId") or obj.get("sessionID") or sid)
+            if obj.get("usage"):
+                meta.update(_extract_usage(obj))
             if obj.get("type") == "result" and isinstance(obj.get("result"), str):
-                return obj["result"], sid
+                return obj["result"], sid, meta
             part_obj = obj.get("part")
-            if obj.get("type") == "text" and isinstance(part_obj, dict) and isinstance(part_obj.get("text"), str):
-                parts.append(part_obj["text"])
-                continue
+            if isinstance(part_obj, dict):
+                if part_obj.get("tokens"):
+                    tok = part_obj["tokens"]
+                    meta["input_tokens"] = meta.get("input_tokens", 0) + int(tok.get("input") or 0) + int((tok.get("cache") or {}).get("read") or 0)
+                    meta["cached_tokens"] = meta.get("cached_tokens", 0) + int((tok.get("cache") or {}).get("read") or 0)
+                    meta["output_tokens"] = meta.get("output_tokens", 0) + int(tok.get("output") or 0)
+                if part_obj.get("cost") is not None:
+                    meta["cost_usd"] = round(meta.get("cost_usd", 0.0) + float(part_obj["cost"]), 6)
+                if obj.get("type") == "text" and isinstance(part_obj.get("text"), str):
+                    parts.append(part_obj["text"])
+                    continue
             part = obj.get("text") or obj.get("delta") or ""
             if isinstance(part, str) and part:
                 parts.append(part)
-    return ("".join(parts) if parts else s), sid
+    return ("".join(parts) if parts else s), sid, meta
 
 
 def _sessions_path(workspace: str = ".") -> str:
@@ -414,7 +447,17 @@ def _git_diff_hunks(workspace: str, files: list[str]) -> dict[str, str]:
     return out
 
 
-def _log_metric(workspace: str, cli: str, mode: str, ok: bool, secs: float, prompt_len: int, pkt_len: int, out_len: int) -> None:
+def _log_metric(
+    workspace: str,
+    cli: str,
+    mode: str,
+    ok: bool,
+    secs: float,
+    prompt_len: int,
+    pkt_len: int,
+    out_len: int,
+    usage: dict | None = None,
+) -> None:
     try:
         path = os.path.join(os.path.abspath(workspace or "."), ".mcp-agents", "metrics.jsonl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -428,6 +471,8 @@ def _log_metric(workspace: str, cli: str, mode: str, ok: bool, secs: float, prom
             "pkt_chars": pkt_len,
             "out_chars": out_len,
         }
+        if usage:
+            rec.update(usage)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
@@ -582,14 +627,14 @@ def run_cli(
                     continue
                 break
 
-            text, out_sid = _extract_json_response(proc.stdout)
+            text, out_sid, usage_meta = _extract_json_response(proc.stdout)
             snap_after = snapshot_worktree(ws) if work else {}
             changed = diff_worktree_snapshots(ws, snap_before, snap_after) if work else []
             if work and changed:
                 record_deltas(cand_actor, _git_diff_hunks(ws, changed), workspace=ws)
 
             if proc.returncode == 0 and (text or changed):
-                _log_metric(ws, cand, eff_mode, True, dur, len(full_prompt), pkt_len, len(text))
+                _log_metric(ws, cand, eff_mode, True, dur, len(full_prompt), pkt_len, len(text), usage=usage_meta)
                 final_sid = out_sid or (eff_sid if cand == cli else "")
                 if role and final_sid:
                     save_role_session(cand, role, final_sid, workspace=ws)
@@ -602,6 +647,8 @@ def run_cli(
                     "session_id": final_sid,
                     "output": smart_truncate(text or "(files modified)", 8000),
                 }
+                if usage_meta:
+                    res["usage"] = usage_meta
                 if changed:
                     res["changed_files"] = changed
                 if work:
@@ -616,7 +663,7 @@ def run_cli(
                     )
                 return res
 
-            _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, len(text))
+            _log_metric(ws, cand, eff_mode, False, dur, len(full_prompt), pkt_len, len(text), usage=usage_meta)
             last_err = smart_truncate(proc.stderr or proc.stdout or f"rc={proc.returncode}", 400)
             # Never fall back on non-rate-limit failures!
             break
